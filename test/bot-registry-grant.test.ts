@@ -16,6 +16,27 @@ describe('bot-registry grant additions', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rm3', larkAppSecret: 's', chatReplyModes: { oc_1: 'nope' } }]))[0].chatReplyModes).toBeUndefined();
   });
 
+  it('normalizes feedbackSurvey and retains only valid gray OpenIDs', () => {
+    const config = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'survey-1',
+      larkAppSecret: 's',
+      feedbackSurvey: {
+        enabled: true,
+        idleDelayMs: 60_000,
+        askTtlMs: 86_400_000,
+        grayOpenIds: [' ou_allowed ', 'ou_allowed', 'bad', 1],
+        larkBase: { appToken: ' app ', tableId: ' table ', identity: 'other' },
+      },
+    }]))[0];
+    expect(config.feedbackSurvey).toEqual({
+      enabled: true,
+      idleDelayMs: 60_000,
+      askTtlMs: 86_400_000,
+      grayOpenIds: ['ou_allowed'],
+      larkBase: { appToken: 'app', tableId: 'table', identity: 'bot' },
+    });
+  });
+
   it('parseBotConfigsFromText preserves & filters chatGrants', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'a1', larkAppSecret: 's',

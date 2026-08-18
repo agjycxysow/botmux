@@ -24,6 +24,7 @@ import type {
   AskResult,
   CreateAskInput,
   PendingAsk,
+  RegisteredAsk,
 } from './ask-types.js';
 import { AskDispatchError } from './ask-types.js';
 
@@ -76,6 +77,9 @@ interface InternalPending extends Omit<PendingAsk, 'selections'> {
    * 按问题序号（questionIndex）累积的勾选 key 集合。
    */
   selections: Map<number, Set<string>>;
+  /** Survey lifecycle callbacks deliberately remain broker-private. */
+  onDispatched?: CreateAskInput['onDispatched'];
+  onSettled?: CreateAskInput['onSettled'];
 }
 
 const pending = new Map<string, InternalPending>();
@@ -145,7 +149,10 @@ export function setCanTalkChecker(
  *  so it follows the canTalk gate — not the stricter canOperate / allowedUsers.
  *  `actor` is only supplied by the text-reply path; card clicks omit it. */
 function isAuthorizedToAnswer(ask: InternalPending, by: string, actor?: AskAnswerActor): boolean {
-  return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.chatType, actor) ?? false;
+  if (!(canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.chatType, actor) ?? false)) {
+    return false;
+  }
+  return ask.expectedResponderOpenIds === undefined || ask.expectedResponderOpenIds.includes(by);
 }
 
 /** Window during which a settled ask is still queryable so race-losers get a
@@ -175,6 +182,13 @@ export function setCardDispatcher(d: AskCardDispatcher): void {
  *  daemon-misconfiguration bug, not a runtime ask failure.
  */
 export function registerAsk(input: CreateAskInput): Promise<AskResult> {
+  return registerAskWithHandle(input).result;
+}
+
+/** Register an ask and return its id immediately with the terminal-result
+ * Promise. Intended for detached callers such as feedback surveys that need to
+ * associate card delivery with their own durable record. */
+export function registerAskWithHandle(input: CreateAskInput): RegisteredAsk {
   if (!dispatcher) {
     throw new Error('ask-broker: cardDispatcher not wired — daemon bootstrap bug');
   }
@@ -214,16 +228,19 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
       // one result; no second ask, no second card.
       if (!existing.settled && !existing.dormant) {
         logger.info?.(`ask-broker: active replay joined ask ${existing.askId} (key=${askKey})`);
-        return new Promise<AskResult>((resolve) => { existing.waiters.push(resolve); });
+        return {
+          askId: existing.askId,
+          result: new Promise<AskResult>((resolve) => { existing.waiters.push(resolve); }),
+        };
       }
       // recent-terminal (settled, still retained): return the same terminal result.
       if (existing.settled && existing.terminalResult && !existing.dormant) {
         logger.info?.(`ask-broker: replay returned retained terminal result for ${existing.askId}`);
-        return Promise.resolve(existing.terminalResult);
+        return { askId: existing.askId, result: Promise.resolve(existing.terminalResult) };
       }
       // dormant (restored after restart): re-attach (handoff or fresh waiter).
       if (existing.dormant) {
-        return reattachByRequest(existing);
+        return { askId: existing.askId, result: reattachByRequest(existing) };
       }
     } else {
       // Same key, DIFFERENT immutable identity (crafted / stale-but-mutated
@@ -233,11 +250,14 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
       logger.warn?.(
         `ask-broker: identity mismatch on key ${askKey} (existing ask ${existing.askId}) — rejecting re-register`,
       );
-      return Promise.resolve<AskResult>({
-        kind: 'invalidated',
-        reason: 'ask identity mismatch (same key, different question set / chat)',
-        selected: null, by: null, comment: null, timedOut: false,
-      });
+      return {
+        askId: existing.askId,
+        result: Promise.resolve<AskResult>({
+          kind: 'invalidated',
+          reason: 'ask identity mismatch (same key, different question set / chat)',
+          selected: null, by: null, comment: null, timedOut: false,
+        }),
+      };
     }
   }
 
@@ -246,7 +266,7 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
   const createdAt = Date.now();
   const deadlineAt = createdAt + input.timeoutMs;
 
-  return new Promise<AskResult>((resolve) => {
+  const result = new Promise<AskResult>((resolve) => {
     const timeoutHandle = setTimeout(() => {
       settle(askId, { kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true });
     }, input.timeoutMs);
@@ -268,12 +288,22 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
       sessionId: input.sessionId,
       chatType: input.chatType,
       questions: input.questions,
+      ...(input.purpose === 'feedback_survey' ? { purpose: 'feedback_survey' as const } : {}),
+      ...(input.expectedResponderOpenIds !== undefined
+        ? { expectedResponderOpenIds: [...input.expectedResponderOpenIds] }
+        : {}),
+      ...((input.allowCustomReply ?? (input.purpose === 'feedback_survey' ? false : undefined)) === false
+        ? { allowCustomReply: false }
+        : {}),
+      ...(input.metadata ? { metadata: { ...input.metadata } } : {}),
       createdAt,
       deadlineAt,
       settled: false,
       waiters: [resolve],
       timeoutHandle,
       selections,
+      onDispatched: input.onDispatched,
+      onSettled: input.onSettled,
     };
     pending.set(askId, ask);
     // Persist ONLY resumable origins (codex P1-4). A restart before the card
@@ -284,6 +314,7 @@ export function registerAsk(input: CreateAskInput): Promise<AskResult> {
     }
     void sendCardForAsk(ask);
   });
+  return { askId, result };
 }
 
 /** Immutable-identity equality: a reattach/replay must match the ORIGINAL ask on
@@ -296,7 +327,11 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
     ask.chatId === input.chatId &&
     ask.rootMessageId === input.rootMessageId &&
     ask.originKind === (input.originKind ?? 'hook') &&
-    questionsShape(ask.questions) === questionsShape(input.questions)
+    questionsShape(ask.questions) === questionsShape(input.questions) &&
+    ask.purpose === (input.purpose === 'feedback_survey' ? 'feedback_survey' : undefined) &&
+    JSON.stringify(ask.expectedResponderOpenIds) === JSON.stringify(input.expectedResponderOpenIds) &&
+    ask.allowCustomReply === (input.allowCustomReply ?? (input.purpose === 'feedback_survey' ? false : undefined)) &&
+    JSON.stringify(ask.metadata) === JSON.stringify(input.metadata)
   );
 }
 
@@ -347,6 +382,7 @@ function sendCardForAsk(ask: InternalPending): void {
         if (cur && !cur.settled) {
           cur.cardMessageId = messageId;
           if (cur.resumable) persistFromInternal(cur);
+          notifyOnDispatched(cur, messageId);
         }
         return; // sent (or server-deduped to the original) — done
       } catch (err) {
@@ -447,6 +483,10 @@ function persistFromInternal(ask: InternalPending): void {
     rootMessageId: ask.rootMessageId,
     sessionId: ask.sessionId,
     chatType: ask.chatType,
+    purpose: ask.purpose,
+    expectedResponderOpenIds: ask.expectedResponderOpenIds,
+    allowCustomReply: ask.allowCustomReply,
+    metadata: ask.metadata,
     questions: ask.questions,
     createdAt: ask.createdAt,
     deadlineAt: ask.deadlineAt,
@@ -613,6 +653,7 @@ export function submitCustomReply(args: {
   const ask = pending.get(args.askId);
   if (!ask) return 'stale';
   if (ask.settled) return 'already_settled';
+  if (ask.allowCustomReply === false) return 'stale';
   if (!isAuthorizedToAnswer(ask, args.by, args.actor)) return 'unauthorized';
   const text = args.text.trim();
   if (!text) return 'stale';
@@ -645,6 +686,7 @@ export function findPendingAskByAnchor(args: {
 }): PendingAsk | undefined {
   for (const ask of pending.values()) {
     if (ask.settled) continue;
+    if (ask.allowCustomReply === false) continue;
     if (ask.larkAppId !== args.larkAppId) continue;
     if (ask.chatId !== args.chatId) continue;
     const matches =
@@ -759,6 +801,10 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       rootMessageId: p.rootMessageId,
       sessionId: p.sessionId,
       chatType: p.chatType,
+      purpose: p.purpose,
+      expectedResponderOpenIds: p.expectedResponderOpenIds,
+      allowCustomReply: p.allowCustomReply,
+      metadata: p.metadata,
       questions: p.questions,
       createdAt: p.createdAt,
       deadlineAt: p.deadlineAt,
@@ -860,20 +906,51 @@ function settle(askId: string, result: AskResult): void {
   notifyOnSettle(ask, result);
 }
 
-/** Notify the IM-side dispatcher's onSettle hook (best-effort — never blocks
- *  broker state). Shared by the normal settle path and the dormant-answer stash. */
-function notifyOnSettle(ask: InternalPending, result: AskResult): void {
-  if (!dispatcher?.onSettle) return;
+/** Notify the detached business owner after a card has a real Feishu message
+ * id. Errors never affect ask delivery or persistence. */
+function notifyOnDispatched(ask: InternalPending, messageId: string): void {
+  if (!ask.onDispatched) return;
   try {
-    void Promise.resolve(dispatcher.onSettle(snapshot(ask), result)).catch((err) => {
+    void Promise.resolve(ask.onDispatched({ askId: ask.askId, messageId })).catch((err) => {
       logger.warn?.(
-        `ask-broker: ${ask.askId} onSettle failed: ${err instanceof Error ? err.message : String(err)}`,
+        `ask-broker: ${ask.askId} onDispatched failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     });
   } catch (err) {
     logger.warn?.(
-      `ask-broker: ${ask.askId} onSettle threw: ${err instanceof Error ? err.message : String(err)}`,
+      `ask-broker: ${ask.askId} onDispatched threw: ${err instanceof Error ? err.message : String(err)}`,
     );
+  }
+}
+
+/** Notify the IM-side dispatcher's onSettle hook (best-effort — never blocks
+ *  broker state). Shared by the normal settle path and the dormant-answer stash. */
+function notifyOnSettle(ask: InternalPending, result: AskResult): void {
+  if (dispatcher?.onSettle) {
+    try {
+      void Promise.resolve(dispatcher.onSettle(snapshot(ask), result)).catch((err) => {
+        logger.warn?.(
+          `ask-broker: ${ask.askId} onSettle failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    } catch (err) {
+      logger.warn?.(
+        `ask-broker: ${ask.askId} onSettle threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  if (ask.onSettled) {
+    try {
+      void Promise.resolve(ask.onSettled(result)).catch((err) => {
+        logger.warn?.(
+          `ask-broker: ${ask.askId} onSettled failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    } catch (err) {
+      logger.warn?.(
+        `ask-broker: ${ask.askId} onSettled threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 }
 
@@ -885,6 +962,7 @@ function snapshot(ask: InternalPending): PendingAsk {
     waiters: _w, timeoutHandle: _t, settledAt: _sat, selections: _sel,
     askKey: _ak, requestId: _rid, originKind: _ok, resumable: _rs,
     dormant: _dm, answeredResult: _ar, terminalResult: _tr,
+    onDispatched: _od, onSettled: _os,
     ...rest
   } = ask;
   return {

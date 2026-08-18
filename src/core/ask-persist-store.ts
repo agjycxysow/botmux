@@ -45,7 +45,7 @@ import { join } from 'node:path';
 
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
-import type { AskQuestion, AskResult } from './ask-types.js';
+import type { AskQuestion, AskResult, CreateAskInput } from './ask-types.js';
 
 /** Sentinel file marking a directory as a botmux ask store. teardown/reset only
  *  ever touches a directory that contains this file — a guard against a missing
@@ -74,6 +74,10 @@ export interface PersistedAsk {
   rootMessageId: string | null;
   sessionId: string;
   chatType?: 'group' | 'p2p';
+  purpose?: CreateAskInput['purpose'];
+  expectedResponderOpenIds?: ReadonlyArray<string>;
+  allowCustomReply?: boolean;
+  metadata?: Readonly<Record<string, string>>;
   questions: ReadonlyArray<AskQuestion>;
   createdAt: number;
   deadlineAt: number;

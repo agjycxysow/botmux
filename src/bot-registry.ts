@@ -31,6 +31,14 @@ import {
   normalizeSessionOwnerReminderConfig,
   type SessionOwnerReminderConfig,
 } from './core/session-owner-reminder.js';
+import {
+  normalizeFeedbackSurveyConfig,
+  type FeedbackSurveyConfig,
+} from './services/feedback-survey.js';
+import {
+  normalizeLogisticsSessionMasterConfig,
+  type LogisticsSessionMasterConfig,
+} from './services/logistics-session-master.js';
 import type {
   VcMeetingConsumerAgentConfig,
   VcMeetingConsumerConfig,
@@ -1219,6 +1227,8 @@ export interface BotConfig {
   /** Per-chat final-answer feedback overrides, scoped to this bot app id. */
   chatFeedbackPolicies?: Record<string, FeedbackPolicyInput>;
   feedbackWebhooks?: { destinations: FeedbackWebhookDestination[] };
+  /** Delayed post-turn survey. Missing or disabled stays inert. */
+  feedbackSurvey?: FeedbackSurveyConfig;
   /**
    * 租户品牌：`'feishu'`（中国版，open.feishu.cn）或 `'lark'`（国际版，
    * open.larksuite.com）。缺省 / 旧 bots.json 无此字段 → 视为 `'feishu'`
@@ -2895,6 +2905,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? Object.fromEntries(Object.entries(entry.chatFeedbackPolicies).map(([chatId, layer]) => [chatId, normalizeFeedbackPolicyLayer(layer)]))
         : undefined,
       feedbackWebhooks: normalizeFeedbackWebhookConfig(entry.feedbackWebhooks),
+      feedbackSurvey: entry.feedbackSurvey === undefined
+        ? undefined
+        : normalizeFeedbackSurveyConfig(entry.feedbackSurvey),
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,

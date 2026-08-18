@@ -835,6 +835,79 @@ describe('自定义回复 findPendingAskByAnchor + submitCustomReply', () => {
   });
 });
 
+describe('feedback survey ask extensions', () => {
+  it('only accepts a feedback-survey response from the expected responder', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const p = registerAsk({
+      ...makeInput(),
+      purpose: 'feedback_survey',
+      expectedResponderOpenIds: ['ou_owner'],
+      allowCustomReply: false,
+    });
+    await Promise.resolve();
+
+    const askId = _allAskIds()[0]!;
+    const nonce = _getPending(askId)!.nonce;
+    expect(tryResolveAsk({ askId, nonce, selected: 'yes', by: 'ou_a' })).toBe('unauthorized');
+    expect(tryResolveAsk({ askId, nonce, selected: 'yes', by: 'ou_owner' })).toBe('accepted');
+    await expect(p).resolves.toMatchObject({ kind: 'answered', by: 'ou_owner' });
+  });
+
+  it('does not let a feedback survey consume a normal text follow-up', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    registerAsk({
+      ...makeInput(),
+      purpose: 'feedback_survey',
+      expectedResponderOpenIds: ['ou_owner'],
+      allowCustomReply: false,
+    });
+    await Promise.resolve();
+
+    expect(findPendingAskByAnchor({
+      larkAppId: 'cli_app',
+      chatId: 'oc_chat',
+      anchor: 'om_root',
+    })).toBeUndefined();
+  });
+
+  it('runs survey dispatch and settlement callbacks without exposing functions in snapshots', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const onDispatched = vi.fn();
+    const onSettled = vi.fn();
+    const p = registerAsk({
+      ...makeInput(),
+      purpose: 'feedback_survey',
+      expectedResponderOpenIds: ['ou_owner'],
+      allowCustomReply: false,
+      onDispatched,
+      onSettled,
+    });
+    await Promise.resolve();
+
+    const askId = _allAskIds()[0]!;
+    const pending = _getPending(askId)!;
+    expect(pending).not.toHaveProperty('onDispatched');
+    expect(pending).not.toHaveProperty('onSettled');
+    expect(onDispatched).toHaveBeenCalledWith({
+      askId,
+      messageId: `om_card_${askId}`,
+    });
+
+    expect(tryResolveAsk({
+      askId,
+      nonce: pending.nonce,
+      selected: 'yes',
+      by: 'ou_owner',
+    })).toBe('accepted');
+    const result = await p;
+    await Promise.resolve();
+    expect(onSettled).toHaveBeenCalledWith(result);
+  });
+});
+
 describe('submitCustomReply actor context — bot / union 身份透传给 checker', () => {
   // 回归 PR #685 复审的同型残留：ask-broker 的 canTalkChecker 被卡片点击和文字作答
   // 共用，但只拿 open_id/chatType，拿不到 bot/union 身份。文字作答路径（daemon 有完整

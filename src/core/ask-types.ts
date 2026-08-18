@@ -119,6 +119,22 @@ export interface CreateAskInput {
   /** 发起 ask 的会话类型。仅用于点击鉴权时把 chatType 喂给 canTalk（p2pOpen 腿）；
    *  缺省时该腿 fail-closed，鉴权退回原语义。 */
   chatType?: 'group' | 'p2p';
+  /** Optional product purpose. Omitted asks retain the existing agent-question
+   * behavior; feedback surveys opt into a restricted response surface. */
+  purpose?: 'agent_question' | 'feedback_survey';
+  /** Optional responder allowlist layered on top of the existing canTalk gate.
+   * When present, even an empty list denies every responder. */
+  expectedResponderOpenIds?: ReadonlyArray<string>;
+  /** Whether a normal text follow-up may settle this ask. Defaults to true for
+   * ordinary asks and false for feedback surveys. */
+  allowCustomReply?: boolean;
+  /** Small card-specific values owned by the caller. Kept data-only so it can
+   * survive a normal ask persistence/restore cycle. */
+  metadata?: Readonly<Record<string, string>>;
+  /** Lifecycle callbacks are broker-internal only and never appear in a
+   * PendingAsk snapshot or persisted ask record. */
+  onDispatched?: (info: { askId: string; messageId: string }) => void | Promise<void>;
+  onSettled?: (result: AskResult) => void | Promise<void>;
 }
 
 /** Daemon-internal state for a pending ask. Not exported on the IPC boundary —
@@ -153,6 +169,22 @@ export interface PendingAsk {
    *  re-send after a daemon restart returns the ORIGINAL message_id instead of
    *  posting a duplicate card. Absent for non-resumable asks. */
   dispatchUuid?: string;
+  /** Product purpose for specialized card rendering. */
+  purpose?: 'agent_question' | 'feedback_survey';
+  /** Optional responder allowlist. See CreateAskInput.expectedResponderOpenIds. */
+  expectedResponderOpenIds?: ReadonlyArray<string>;
+  /** False prevents normal text replies from being routed to this ask. */
+  allowCustomReply?: boolean;
+  /** Data-only rendering context supplied by the caller. */
+  metadata?: Readonly<Record<string, string>>;
+}
+
+/** Handle returned by detached consumers that need the generated ask id before
+ * the answer Promise settles. Existing registerAsk remains Promise-only for
+ * backward compatibility. */
+export interface RegisteredAsk {
+  askId: string;
+  result: Promise<AskResult>;
 }
 
 /** Outcome of a click-resolution attempt. Card click handler maps these to

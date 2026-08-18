@@ -202,6 +202,78 @@ describe('buildAskCard', () => {
     });
     expect(text).toContain('超时');
   });
+
+  it('feedback survey uses a five-star Card 2.0 with a sanitized recap', () => {
+    const ask = makePending({
+      purpose: 'feedback_survey',
+      allowCustomReply: false,
+      metadata: {
+        recapPrompt: '帮我检查 <script>alert(1)</script> 的灰度配置',
+        recapAnswer: '已定位 [文档](https://example.com/secret)',
+      },
+      questions: [{
+        prompt: '这次回答对你的帮助有多大？',
+        options: [
+          { key: '1', label: '⭐ 很不满意' },
+          { key: '2', label: '⭐⭐ 不满意' },
+          { key: '3', label: '⭐⭐⭐ 一般' },
+          { key: '4', label: '⭐⭐⭐⭐ 满意' },
+          { key: '5', label: '⭐⭐⭐⭐⭐ 非常满意' },
+        ],
+        multiSelect: false,
+      }],
+    });
+    const card = JSON.parse(buildAskCard(ask));
+    const text = JSON.stringify(card);
+
+    expect(card.schema).toBe('2.0');
+    expect(text).toContain('本次回答，帮到你了吗？');
+    expect(text).toContain('Recap · 本轮回顾');
+    expect(text).toContain('ask_select');
+    expect(text).toContain('"key":"1"');
+    expect(text).toContain('"key":"5"');
+    expect(text).not.toContain('<script>');
+  });
+
+  it('feedback survey terminal card retains recap and selected rating', () => {
+    const text = buildAskCard(makePending({
+      purpose: 'feedback_survey',
+      metadata: { recapPrompt: '问题摘要', recapAnswer: '回答摘要' },
+      questions: [{
+        prompt: '评分',
+        options: [{ key: '1', label: '⭐' }, { key: '2', label: '⭐⭐' }],
+        multiSelect: false,
+      }],
+    }), {
+      kind: 'answered',
+      answers: [['5']],
+      by: 'ou_owner',
+      comment: null,
+      timedOut: false,
+    });
+    expect(text).toContain('问题摘要');
+    expect(text).toContain('回答摘要');
+    expect(text).toContain('⭐⭐⭐⭐⭐');
+    expect(text).not.toContain(ASK_SELECT_ACTION);
+  });
+
+  it('feedback survey escapes recap text before rendering it as card markdown', () => {
+    const text = buildAskCard(makePending({
+      purpose: 'feedback_survey',
+      metadata: {
+        recapPrompt: '阈值是 5 < 6 & 7 > 3',
+        recapAnswer: '不渲染 <script>alert(1)</script>',
+      },
+      questions: [{
+        prompt: '评分',
+        options: [{ key: '1', label: '⭐' }, { key: '2', label: '⭐⭐' }],
+        multiSelect: false,
+      }],
+    }));
+
+    expect(text).toContain('阈值是 5 &lt; 6 &amp; 7 &gt; 3');
+    expect(text).not.toContain('<script>');
+  });
 });
 
 describe('handleAskCardAction', () => {

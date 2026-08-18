@@ -9,6 +9,7 @@ import { getAskSnapshot, submitAsk, toggleAsk, tryResolveAsk } from '../../core/
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
 import { replyMessage, sendMessage, updateMessage } from './client.js';
+import { buildFeedbackSurveyCard } from './feedback-card.js';
 
 /** 旧单选即答动作（保留兼容旧卡片回调；Task 5 新增 ask_submit 路径）。 */
 export const ASK_SELECT_ACTION = 'ask_select';
@@ -313,6 +314,9 @@ function settledCardResponse(askId: string, result: AskResult): Record<string, u
  * 已 settle 时：渲染状态摘要，展示每问的选中标签（answered），或超时/失效信息。
  */
 export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confirmEmptyArmed?: boolean }): string {
+  if (ask.purpose === 'feedback_survey') {
+    return buildFeedbackSurveyCard(ask, result);
+  }
   const locale = localeForBot(ask.larkAppId);
   const deadline = new Date(ask.deadlineAt).toLocaleString('zh-CN');
   const status = result ? settleStatus(result, ask, locale) : undefined;

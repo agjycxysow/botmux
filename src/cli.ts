@@ -10049,6 +10049,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     chatId: s.chatId,
     rootMessageId: s.rootMessageId,
     title: s.title,
+    turnId: currentTurnId,
+    source: 'botmux_send',
+    feedbackEligible: !sendTopLevel && !overrideChatId && !sendInto && !vcMeetingManagedSendOrigin,
   };
   // Ordinary delivery uses the nominal target. Deferred delivery gets first
   // refusal below; the advisory mirrors its existing binding in
