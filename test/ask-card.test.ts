@@ -203,7 +203,7 @@ describe('buildAskCard', () => {
     expect(text).toContain('超时');
   });
 
-  it('feedback survey uses a five-star Card 2.0 with a sanitized recap', () => {
+  it('feedback survey follows the headerless reference layout with five equal rating cells', () => {
     const ask = makePending({
       purpose: 'feedback_survey',
       allowCustomReply: false,
@@ -225,25 +225,64 @@ describe('buildAskCard', () => {
     });
     const card = JSON.parse(buildAskCard(ask));
     const text = JSON.stringify(card);
+    const elements = card.body.elements as Array<Record<string, any>>;
+    const recap = elements.find((element) =>
+      element.tag === 'interactive_container' && element.background_style === 'grey',
+    );
+    const ratingPrompt = elements.find((element) =>
+      element.tag === 'interactive_container' && element.background_style === 'blue',
+    );
+    const ratingRow = elements.find((element) => element.tag === 'column_set'
+      && Array.isArray(element.columns) && element.columns.length === 5);
 
     expect(card.schema).toBe('2.0');
+    expect(card.header).toBeUndefined();
+    expect(card.body.padding).toBe('20px');
     expect(text).toContain('本次回答，帮到你了吗？');
     expect(text).toContain('Recap · 本轮回顾');
-    expect(text).toContain('ask_select');
-    expect(text).toContain('"key":"1"');
-    expect(text).toContain('"key":"5"');
     expect(text).not.toContain('"tag":"action"');
-    const buttons = card.body.elements.filter((element: { tag?: string }) => element.tag === 'button');
-    expect(buttons).toHaveLength(5);
-    expect(buttons.every((button: { behaviors?: Array<{ type?: string; value?: { action?: string } }> }) =>
-      button.behaviors?.[0]?.type === 'callback'
-      && button.behaviors[0].value?.action === ASK_SELECT_ACTION,
-    )).toBe(true);
+    expect(recap).toMatchObject({
+      has_border: true,
+      border_color: 'grey-200',
+      corner_radius: '8px',
+    });
+    expect(ratingPrompt).toMatchObject({
+      padding: '8px 12px',
+      corner_radius: '8px',
+    });
+    expect(JSON.stringify(ratingPrompt)).toContain('请选择一个最符合你感受的评分');
+    expect(ratingRow).toMatchObject({
+      flex_mode: 'none',
+      horizontal_spacing: 'small',
+    });
+    expect(ratingRow?.columns).toHaveLength(5);
+    for (const [index, column] of ratingRow?.columns.entries() ?? []) {
+      const ratingCell = column.elements[0];
+      expect(ratingCell).toMatchObject({
+        tag: 'interactive_container',
+        background_style: 'default',
+        border_color: 'grey-300',
+        corner_radius: '8px',
+      });
+      expect(ratingCell.elements[0].content).toBe(`**${index + 1} ★**`);
+      expect(ratingCell.behaviors).toEqual([{
+        type: 'callback',
+        value: {
+          action: ASK_SELECT_ACTION,
+          ask_id: 'ask-1',
+          nonce: 'nonce-1',
+          key: String(index + 1),
+        },
+      }]);
+    }
+    expect(text).toContain('很不满意');
+    expect(text).toContain('非常满意');
+    expect(elements.at(-1)).toMatchObject({ text_align: 'center' });
     expect(text).not.toContain('<script>');
   });
 
-  it('feedback survey terminal card retains recap and selected rating', () => {
-    const text = buildAskCard(makePending({
+  it('feedback survey terminal card keeps the question recap with a neutral completion panel', () => {
+    const card = JSON.parse(buildAskCard(makePending({
       purpose: 'feedback_survey',
       metadata: { recapPrompt: '问题摘要', recapAnswer: '回答摘要' },
       questions: [{
@@ -257,11 +296,15 @@ describe('buildAskCard', () => {
       by: 'ou_owner',
       comment: null,
       timedOut: false,
-    });
+    }));
+    const text = JSON.stringify(card);
     expect(text).toContain('问题摘要');
-    expect(text).toContain('回答摘要');
-    expect(text).toContain('⭐⭐⭐⭐⭐');
+    expect(text).not.toContain('回答摘要');
+    expect(text).toContain('★★★★★');
+    expect(text).toContain('感谢你的反馈');
     expect(text).not.toContain(ASK_SELECT_ACTION);
+    expect(text).not.toContain('"green"');
+    expect(card.header).toBeUndefined();
   });
 
   it('feedback survey escapes recap text before rendering it as card markdown', () => {
