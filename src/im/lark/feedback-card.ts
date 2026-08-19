@@ -74,20 +74,20 @@ export function buildFeedbackSurveyCard(ask: PendingAsk, result?: AskResult): st
     });
   } else {
     const options = ask.questions[0]?.options ?? [];
-    elements.push({
-      tag: 'action',
-      actions: options.map((option) => ({
+    elements.push(...options.map((option) => ({
         tag: 'button',
         text: { tag: 'plain_text', content: option.label },
         type: 'default',
-        value: {
-          action: ASK_SELECT_ACTION,
-          ask_id: ask.askId,
-          nonce: ask.nonce,
-          key: option.key,
-        },
-      })),
-    });
+        behaviors: [{
+          type: 'callback',
+          value: {
+            action: ASK_SELECT_ACTION,
+            ask_id: ask.askId,
+            nonce: ask.nonce,
+            key: option.key,
+          },
+        }],
+      })));
   }
 
   elements.push({

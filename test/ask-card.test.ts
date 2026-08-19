@@ -232,6 +232,13 @@ describe('buildAskCard', () => {
     expect(text).toContain('ask_select');
     expect(text).toContain('"key":"1"');
     expect(text).toContain('"key":"5"');
+    expect(text).not.toContain('"tag":"action"');
+    const buttons = card.body.elements.filter((element: { tag?: string }) => element.tag === 'button');
+    expect(buttons).toHaveLength(5);
+    expect(buttons.every((button: { behaviors?: Array<{ type?: string; value?: { action?: string } }> }) =>
+      button.behaviors?.[0]?.type === 'callback'
+      && button.behaviors[0].value?.action === ASK_SELECT_ACTION,
+    )).toBe(true);
     expect(text).not.toContain('<script>');
   });
 
