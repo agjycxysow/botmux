@@ -230,10 +230,15 @@ describe('buildAskCard', () => {
       element.tag === 'interactive_container' && element.background_style === 'grey',
     );
     const ratingPrompt = elements.find((element) =>
-      element.tag === 'interactive_container' && element.background_style === 'blue',
+      element.tag === 'interactive_container'
+      && JSON.stringify(element).includes('请选择一个最符合你感受的评分'),
     );
     const ratingRow = elements.find((element) => element.tag === 'column_set'
       && Array.isArray(element.columns) && element.columns.length === 5);
+    const subtitle = elements.find((element) =>
+      element.tag === 'div' && element.text?.content === '你的反馈会帮助我们持续改进回答质量',
+    );
+    const footer = elements.at(-1);
 
     expect(card.schema).toBe('2.0');
     expect(card.header).toBeUndefined();
@@ -248,9 +253,18 @@ describe('buildAskCard', () => {
     });
     expect(ratingPrompt).toMatchObject({
       padding: '8px 12px',
+      background_style: 'blue-50',
       corner_radius: '8px',
     });
     expect(JSON.stringify(ratingPrompt)).toContain('请选择一个最符合你感受的评分');
+    expect(subtitle).toMatchObject({
+      text: {
+        tag: 'plain_text',
+        text_color: 'grey',
+        text_size: 'normal',
+      },
+    });
+    expect(text).not.toContain('<text_tag');
     expect(ratingRow).toMatchObject({
       flex_mode: 'none',
       horizontal_spacing: 'small',
@@ -260,8 +274,8 @@ describe('buildAskCard', () => {
       const ratingCell = column.elements[0];
       expect(ratingCell).toMatchObject({
         tag: 'interactive_container',
-        background_style: 'default',
-        border_color: 'grey-300',
+        background_style: 'grey-50',
+        border_color: 'grey-200',
         corner_radius: '8px',
       });
       expect(ratingCell.elements[0].content).toBe(`**${index + 1} ★**`);
@@ -277,7 +291,14 @@ describe('buildAskCard', () => {
     }
     expect(text).toContain('很不满意');
     expect(text).toContain('非常满意');
-    expect(elements.at(-1)).toMatchObject({ text_align: 'center' });
+    expect(footer).toMatchObject({
+      tag: 'div',
+      text: {
+        tag: 'plain_text',
+        text_color: 'grey',
+        text_align: 'center',
+      },
+    });
     expect(text).not.toContain('<script>');
   });
 

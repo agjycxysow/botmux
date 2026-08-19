@@ -42,7 +42,7 @@ function recapContainer(prompt: string): Record<string, unknown> {
   return {
     tag: 'interactive_container',
     width: 'fill',
-    padding: '12px',
+    padding: '16px 20px',
     background_style: 'grey',
     has_border: true,
     border_color: 'grey-200',
@@ -54,9 +54,13 @@ function recapContainer(prompt: string): Record<string, unknown> {
         text_size: 'normal',
       },
       {
-        tag: 'markdown',
-        content: `<text_tag color="mm_muted">你提出</text_tag> · ${prompt || '未记录'}`,
-        text_size: 'normal',
+        tag: 'div',
+        text: {
+          tag: 'plain_text',
+          content: `你提出 · ${prompt || '未记录'}`,
+          text_color: 'grey',
+          text_size: 'normal',
+        },
       },
     ],
   };
@@ -67,7 +71,7 @@ function ratingPrompt(): Record<string, unknown> {
     tag: 'interactive_container',
     width: 'fill',
     padding: '8px 12px',
-    background_style: 'blue',
+    background_style: 'blue-50',
     has_border: false,
     corner_radius: '8px',
     elements: [{
@@ -92,9 +96,9 @@ function ratingColumns(ask: PendingAsk): Record<string, unknown> {
         tag: 'interactive_container',
         width: 'fill',
         padding: '8px 0',
-        background_style: 'default',
+        background_style: 'grey-50',
         has_border: true,
-        border_color: 'grey-300',
+        border_color: 'grey-200',
         corner_radius: '8px',
         behaviors: [{
           type: 'callback',
@@ -127,9 +131,13 @@ function ratingScaleLabels(): Record<string, unknown> {
         width: 'weighted',
         weight: 1,
         elements: [{
-          tag: 'markdown',
-          content: '<text_tag color="mm_muted">很不满意</text_tag>',
-          text_size: 'notation',
+          tag: 'div',
+          text: {
+            tag: 'plain_text',
+            content: '很不满意',
+            text_color: 'grey',
+            text_size: 'normal',
+          },
         }],
       },
       {
@@ -137,10 +145,14 @@ function ratingScaleLabels(): Record<string, unknown> {
         width: 'weighted',
         weight: 1,
         elements: [{
-          tag: 'markdown',
-          content: '<text_tag color="mm_muted">非常满意</text_tag>',
-          text_align: 'right',
-          text_size: 'notation',
+          tag: 'div',
+          text: {
+            tag: 'plain_text',
+            content: '非常满意',
+            text_color: 'grey',
+            text_align: 'right',
+            text_size: 'normal',
+          },
         }],
       },
     ],
@@ -178,10 +190,13 @@ export function buildFeedbackSurveyCard(ask: PendingAsk, result?: AskResult): st
       text_size: 'heading',
     },
     {
-      tag: 'markdown',
-      content: '<text_tag color="mm_muted">你的反馈会帮助我们持续改进回答质量</text_tag>',
-      text_align: 'left',
-      text_size: 'notation',
+      tag: 'div',
+      text: {
+        tag: 'plain_text',
+        content: '你的反馈会帮助我们持续改进回答质量',
+        text_color: 'grey',
+        text_size: 'normal',
+      },
     },
     recapContainer(prompt),
   ];
@@ -193,10 +208,14 @@ export function buildFeedbackSurveyCard(ask: PendingAsk, result?: AskResult): st
   }
 
   elements.push({
-    tag: 'markdown',
-    content: '<text_tag color="mm_muted">仅本轮提问者可评价 · 24 小时内有效</text_tag>',
-    text_align: 'center',
-    text_size: 'notation',
+    tag: 'div',
+    text: {
+      tag: 'plain_text',
+      content: '仅本轮提问者可评价 · 24 小时内有效',
+      text_color: 'grey',
+      text_align: 'center',
+      text_size: 'normal',
+    },
   });
 
   return JSON.stringify({
