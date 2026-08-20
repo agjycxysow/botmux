@@ -250,6 +250,32 @@ Example:
 - **Only when `summaryMemory` is enabled**, text following the `/summary` command is treated as a hard boundary: it locates the **most recent** message before the trigger that contains that text and summarizes only from there up to the current trigger; if the boundary is not found in the scanned history, botmux does not fall back to a wider range but hands the agent a "boundary not found" error together with an empty history (the memory write instruction still runs). When `summaryMemory` is off, text after `/summary` is only a focus hint for the summary and the history window still follows `summaryRange`.
 - The memory file is written by the agent within its working directory. If the bot has sandbox enabled and `summaryMemoryPath` points outside the working directory (an absolute path, or a relative path that escapes via `../`), add the file's **existing parent directory** to `sandboxPaths.readWrite`; the worker filters out paths that do not yet exist at spawn time, and a new memory file usually does not exist yet, so adding only the file path itself is dropped (unless the file is pre-created). Otherwise the write may be denied by the sandbox.
 
+## Delayed satisfaction survey
+
+`feedbackSurvey` sends an optional satisfaction card after a completed reply. Configure rollout users and their individual delivery delays through `recipients`:
+
+```json
+{
+  "feedbackSurvey": {
+    "enabled": true,
+    "recipients": [
+      { "openId": "ou_user_fast", "idleDelayMs": 60000 },
+      { "openId": "ou_user_slow", "idleDelayMs": 300000 }
+    ],
+    "askTtlMs": 86400000
+  }
+}
+```
+
+| Field | Description |
+|------|------|
+| `recipients` | Authoritative rollout list. Each item requires an app-scoped `openId` and a positive integer `idleDelayMs`. An empty array explicitly disables the survey for everyone. |
+| `recipients[].openId` | The requester eligible to receive a survey. Duplicate IDs keep the first valid rule. |
+| `recipients[].idleDelayMs` | Delay after the final reply. A new user message in the same session before this delay expires cancels the unsent survey. |
+| `askTtlMs` | How long the dispatched rating card remains answerable. Defaults to 24 hours. |
+
+Legacy `grayOpenIds` and the shared `idleDelayMs` remain readable for existing configurations. When `recipients` is present, it takes precedence and the legacy fields are ignored.
+
 ## Legacy content trigger config
 
 | Field | Description |

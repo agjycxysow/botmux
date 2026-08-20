@@ -8,11 +8,22 @@ import { logger } from '../utils/logger.js';
 const DEFAULT_IDLE_DELAY_MS = 10 * 60_000;
 const DEFAULT_ASK_TTL_MS = 24 * 60 * 60_000;
 
+export interface FeedbackSurveyRecipient {
+  openId: string;
+  idleDelayMs: number;
+}
+
 export interface FeedbackSurveyConfig {
   enabled?: boolean;
+  /**
+   * Authoritative survey gray-list and delay rules. When present, this replaces
+   * the legacy `grayOpenIds` + shared `idleDelayMs` configuration.
+   */
+  recipients?: ReadonlyArray<FeedbackSurveyRecipient>;
+  /** Legacy shared delay used only when `recipients` is absent. */
   idleDelayMs?: number;
   askTtlMs?: number;
-  /** App-scoped OpenIDs eligible to receive the survey. Empty means disabled. */
+  /** Legacy allowlist. Prefer `recipients` for new configuration. */
   grayOpenIds?: ReadonlyArray<string>;
   larkBase?: {
     appToken: string;
@@ -25,6 +36,8 @@ export interface NormalizedFeedbackSurveyConfig {
   enabled: boolean;
   idleDelayMs: number;
   askTtlMs: number;
+  recipients: FeedbackSurveyRecipient[];
+  /** Derived from recipients for backward-compatible observability consumers. */
   grayOpenIds: string[];
   larkBase?: {
     appToken: string;
@@ -171,16 +184,36 @@ function normalizeGrayOpenIds(value: unknown): string[] {
   return [...seen];
 }
 
+function normalizeRecipients(value: unknown): FeedbackSurveyRecipient[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const recipients: FeedbackSurveyRecipient[] = [];
+  for (const item of value) {
+    const raw = asRecord(item);
+    const openId = typeof raw?.openId === 'string' ? raw.openId.trim() : '';
+    const idleDelayMs = positiveInt(raw?.idleDelayMs);
+    if (!/^ou_\S+$/.test(openId) || !idleDelayMs || seen.has(openId)) continue;
+    seen.add(openId);
+    recipients.push({ openId, idleDelayMs });
+  }
+  return recipients;
+}
+
 export function normalizeFeedbackSurveyConfig(input: unknown): NormalizedFeedbackSurveyConfig {
   const raw = asRecord(input);
   const rawBase = asRecord(raw?.larkBase);
   const appToken = typeof rawBase?.appToken === 'string' ? rawBase.appToken.trim() : '';
   const tableId = typeof rawBase?.tableId === 'string' ? rawBase.tableId.trim() : '';
+  const idleDelayMs = positiveInt(raw?.idleDelayMs) ?? DEFAULT_IDLE_DELAY_MS;
+  const recipients = Object.prototype.hasOwnProperty.call(raw ?? {}, 'recipients')
+    ? normalizeRecipients(raw?.recipients)
+    : normalizeGrayOpenIds(raw?.grayOpenIds).map(openId => ({ openId, idleDelayMs }));
   return {
     enabled: raw?.enabled === true,
-    idleDelayMs: positiveInt(raw?.idleDelayMs) ?? DEFAULT_IDLE_DELAY_MS,
+    idleDelayMs,
     askTtlMs: positiveInt(raw?.askTtlMs) ?? DEFAULT_ASK_TTL_MS,
-    grayOpenIds: normalizeGrayOpenIds(raw?.grayOpenIds),
+    recipients,
+    grayOpenIds: recipients.map(recipient => recipient.openId),
     larkBase: appToken && tableId
       ? { appToken, tableId, identity: rawBase?.identity === 'user' ? 'user' : 'bot' }
       : undefined,
@@ -285,7 +318,8 @@ export class FeedbackSurveyManager {
   }): void {
     if (!this.config.enabled) return;
     const respondentOpenId = input.respondentOpenId ?? this.callers.get(input.turnId);
-    if (!respondentOpenId || !this.isGrayOpenId(respondentOpenId)) return;
+    const recipient = respondentOpenId ? this.recipientFor(respondentOpenId) : undefined;
+    if (!respondentOpenId || !recipient) return;
 
     const now = this.now();
     const surveyId = stableSurveyId(this.options.larkAppId, input.sessionId, input.turnId);
@@ -305,7 +339,7 @@ export class FeedbackSurveyManager {
       answerMessageId: input.answerMessageId ?? previous?.answerMessageId,
       status: 'scheduled',
       scheduledAt: now,
-      dueAt: now + this.config.idleDelayMs,
+      dueAt: now + recipient.idleDelayMs,
       updatedAt: now,
     };
     this.records.set(surveyId, record);
@@ -423,8 +457,8 @@ export class FeedbackSurveyManager {
     this.persist();
   }
 
-  private isGrayOpenId(openId: string): boolean {
-    return this.config.grayOpenIds.includes(openId);
+  private recipientFor(openId: string): FeedbackSurveyRecipient | undefined {
+    return this.config.recipients.find(recipient => recipient.openId === openId);
   }
 
   private async buildRecap(record: FeedbackSurveyRecord): Promise<{ prompt: string; answer: string }> {

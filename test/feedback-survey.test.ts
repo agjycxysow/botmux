@@ -36,6 +36,7 @@ describe('normalizeFeedbackSurveyConfig', () => {
       idleDelayMs: 10 * 60_000,
       askTtlMs: 24 * 60 * 60_000,
       grayOpenIds: [],
+      recipients: [],
       larkBase: undefined,
     });
 
@@ -50,7 +51,38 @@ describe('normalizeFeedbackSurveyConfig', () => {
       idleDelayMs: 60_000,
       askTtlMs: 86_400_000,
       grayOpenIds: ['ou_allowed'],
+      recipients: [{ openId: 'ou_allowed', idleDelayMs: 60_000 }],
       larkBase: { appToken: 'app', tableId: 'table', identity: 'user' },
+    });
+  });
+
+  it('uses explicit recipients as the authoritative gray list and normalizes each delay', () => {
+    expect(normalizeFeedbackSurveyConfig({
+      enabled: true,
+      idleDelayMs: 60_000,
+      grayOpenIds: ['ou_legacy'],
+      recipients: [
+        { openId: ' ou_fast ', idleDelayMs: 30_000 },
+        { openId: 'ou_fast', idleDelayMs: 120_000 },
+        { openId: 'ou_slow', idleDelayMs: 300_000 },
+        { openId: 'ou_invalid_delay', idleDelayMs: 0 },
+        { openId: 'not-an-open-id', idleDelayMs: 60_000 },
+      ],
+    })).toMatchObject({
+      grayOpenIds: ['ou_fast', 'ou_slow'],
+      recipients: [
+        { openId: 'ou_fast', idleDelayMs: 30_000 },
+        { openId: 'ou_slow', idleDelayMs: 300_000 },
+      ],
+    });
+
+    expect(normalizeFeedbackSurveyConfig({
+      enabled: true,
+      grayOpenIds: ['ou_legacy'],
+      recipients: [],
+    })).toMatchObject({
+      grayOpenIds: [],
+      recipients: [],
     });
   });
 });
@@ -158,6 +190,72 @@ describe('FeedbackSurveyManager', () => {
       sessionId: 'session-gray',
       respondentOpenId: 'ou_allowed',
     }]);
+    manager.stop();
+  });
+
+  it('schedules each configured recipient with that recipient delay', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-20T12:00:00Z'));
+    const dataDir = await makeDataDir();
+    const registerAsk = vi.fn(() => ({
+      askId: 'ask-1',
+      result: new Promise(() => {}),
+    }));
+    const manager = new FeedbackSurveyManager({
+      dataDir,
+      larkAppId: 'cli_feedback',
+      config: {
+        enabled: true,
+        recipients: [
+          { openId: 'ou_fast', idleDelayMs: 1_000 },
+          { openId: 'ou_slow', idleDelayMs: 5_000 },
+        ],
+      },
+      registerAsk,
+      getMessage: vi.fn(async () => ({ chatId: 'oc_chat', content: '' })),
+    });
+
+    manager.noteUserActivity({
+      sessionId: 'session-fast',
+      turnId: 'turn-fast',
+      senderOpenId: 'ou_fast',
+    });
+    manager.scheduleForTurn({
+      sessionId: 'session-fast',
+      turnId: 'turn-fast',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root_fast',
+    });
+    manager.noteUserActivity({
+      sessionId: 'session-slow',
+      turnId: 'turn-slow',
+      senderOpenId: 'ou_slow',
+    });
+    manager.scheduleForTurn({
+      sessionId: 'session-slow',
+      turnId: 'turn-slow',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root_slow',
+    });
+
+    expect(manager.listRecords()).toMatchObject([
+      { respondentOpenId: 'ou_fast', dueAt: Date.now() + 1_000 },
+      { respondentOpenId: 'ou_slow', dueAt: Date.now() + 5_000 },
+    ]);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(registerAsk).toHaveBeenCalledTimes(1);
+    expect(registerAsk.mock.calls[0]?.[0]).toMatchObject({
+      sessionId: 'session-fast',
+      expectedResponderOpenIds: ['ou_fast'],
+    });
+
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(registerAsk).toHaveBeenCalledTimes(2);
+    expect(registerAsk.mock.calls[1]?.[0]).toMatchObject({
+      sessionId: 'session-slow',
+      expectedResponderOpenIds: ['ou_slow'],
+    });
     manager.stop();
   });
 

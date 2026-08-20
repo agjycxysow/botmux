@@ -16,7 +16,7 @@ describe('bot-registry grant additions', () => {
     expect(parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'rm3', larkAppSecret: 's', chatReplyModes: { oc_1: 'nope' } }]))[0].chatReplyModes).toBeUndefined();
   });
 
-  it('normalizes feedbackSurvey and retains only valid gray OpenIDs', () => {
+  it('normalizes legacy feedbackSurvey gray OpenIDs into recipient delay rules', () => {
     const config = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'survey-1',
       larkAppSecret: 's',
@@ -33,6 +33,7 @@ describe('bot-registry grant additions', () => {
       idleDelayMs: 60_000,
       askTtlMs: 86_400_000,
       grayOpenIds: ['ou_allowed'],
+      recipients: [{ openId: 'ou_allowed', idleDelayMs: 60_000 }],
       larkBase: { appToken: 'app', tableId: 'table', identity: 'bot' },
     });
   });
