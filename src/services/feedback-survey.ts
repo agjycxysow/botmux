@@ -20,6 +20,8 @@ export interface FeedbackSurveyConfig {
    * the legacy `grayOpenIds` + shared `idleDelayMs` configuration.
    */
   recipients?: ReadonlyArray<FeedbackSurveyRecipient>;
+  /** Optional fallback delay for user responders without an explicit recipient rule. */
+  defaultIdleDelayMs?: number;
   /** Legacy shared delay used only when `recipients` is absent. */
   idleDelayMs?: number;
   askTtlMs?: number;
@@ -37,6 +39,7 @@ export interface NormalizedFeedbackSurveyConfig {
   idleDelayMs: number;
   askTtlMs: number;
   recipients: FeedbackSurveyRecipient[];
+  defaultIdleDelayMs?: number;
   /** Derived from recipients for backward-compatible observability consumers. */
   grayOpenIds: string[];
   larkBase?: {
@@ -208,11 +211,13 @@ export function normalizeFeedbackSurveyConfig(input: unknown): NormalizedFeedbac
   const recipients = Object.prototype.hasOwnProperty.call(raw ?? {}, 'recipients')
     ? normalizeRecipients(raw?.recipients)
     : normalizeGrayOpenIds(raw?.grayOpenIds).map(openId => ({ openId, idleDelayMs }));
+  const defaultIdleDelayMs = positiveInt(raw?.defaultIdleDelayMs);
   return {
     enabled: raw?.enabled === true,
     idleDelayMs,
     askTtlMs: positiveInt(raw?.askTtlMs) ?? DEFAULT_ASK_TTL_MS,
     recipients,
+    ...(defaultIdleDelayMs ? { defaultIdleDelayMs } : {}),
     grayOpenIds: recipients.map(recipient => recipient.openId),
     larkBase: appToken && tableId
       ? { appToken, tableId, identity: rawBase?.identity === 'user' ? 'user' : 'bot' }
@@ -458,7 +463,11 @@ export class FeedbackSurveyManager {
   }
 
   private recipientFor(openId: string): FeedbackSurveyRecipient | undefined {
-    return this.config.recipients.find(recipient => recipient.openId === openId);
+    const explicit = this.config.recipients.find(recipient => recipient.openId === openId);
+    if (explicit) return explicit;
+    return this.config.defaultIdleDelayMs
+      ? { openId, idleDelayMs: this.config.defaultIdleDelayMs }
+      : undefined;
   }
 
   private async buildRecap(record: FeedbackSurveyRecord): Promise<{ prompt: string; answer: string }> {

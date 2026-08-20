@@ -85,6 +85,22 @@ describe('normalizeFeedbackSurveyConfig', () => {
       recipients: [],
     });
   });
+
+  it('normalizes a positive default delay without enabling a fallback for invalid values', () => {
+    expect(normalizeFeedbackSurveyConfig({
+      enabled: true,
+      recipients: [{ openId: 'ou_fast', idleDelayMs: 60_000 }],
+      defaultIdleDelayMs: 900_000,
+    })).toMatchObject({
+      recipients: [{ openId: 'ou_fast', idleDelayMs: 60_000 }],
+      defaultIdleDelayMs: 900_000,
+    });
+
+    expect(normalizeFeedbackSurveyConfig({
+      enabled: true,
+      defaultIdleDelayMs: 0,
+    }).defaultIdleDelayMs).toBeUndefined();
+  });
 });
 
 describe('FeedbackSurveyManager', () => {
@@ -255,6 +271,70 @@ describe('FeedbackSurveyManager', () => {
     expect(registerAsk.mock.calls[1]?.[0]).toMatchObject({
       sessionId: 'session-slow',
       expectedResponderOpenIds: ['ou_slow'],
+    });
+    manager.stop();
+  });
+
+  it('uses the default delay for an unlisted user while preserving an explicit recipient delay', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-20T12:00:00Z'));
+    const dataDir = await makeDataDir();
+    const registerAsk = vi.fn(() => ({
+      askId: 'ask-1',
+      result: new Promise(() => {}),
+    }));
+    const manager = new FeedbackSurveyManager({
+      dataDir,
+      larkAppId: 'cli_feedback',
+      config: {
+        enabled: true,
+        recipients: [{ openId: 'ou_fast', idleDelayMs: 1_000 }],
+        defaultIdleDelayMs: 5_000,
+      },
+      registerAsk,
+      getMessage: vi.fn(async () => ({ chatId: 'oc_chat', content: '' })),
+    });
+
+    manager.noteUserActivity({
+      sessionId: 'session-fast',
+      turnId: 'turn-fast',
+      senderOpenId: 'ou_fast',
+    });
+    manager.scheduleForTurn({
+      sessionId: 'session-fast',
+      turnId: 'turn-fast',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root_fast',
+    });
+    manager.noteUserActivity({
+      sessionId: 'session-default',
+      turnId: 'turn-default',
+      senderOpenId: 'ou_default',
+    });
+    manager.scheduleForTurn({
+      sessionId: 'session-default',
+      turnId: 'turn-default',
+      chatId: 'oc_chat',
+      rootMessageId: 'om_root_default',
+    });
+
+    expect(manager.listRecords()).toMatchObject([
+      { respondentOpenId: 'ou_fast', dueAt: Date.now() + 1_000 },
+      { respondentOpenId: 'ou_default', dueAt: Date.now() + 5_000 },
+    ]);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(registerAsk).toHaveBeenCalledTimes(1);
+    expect(registerAsk.mock.calls[0]?.[0]).toMatchObject({
+      sessionId: 'session-fast',
+      expectedResponderOpenIds: ['ou_fast'],
+    });
+
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(registerAsk).toHaveBeenCalledTimes(2);
+    expect(registerAsk.mock.calls[1]?.[0]).toMatchObject({
+      sessionId: 'session-default',
+      expectedResponderOpenIds: ['ou_default'],
     });
     manager.stop();
   });

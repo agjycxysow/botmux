@@ -262,6 +262,7 @@ Example:
       { "openId": "ou_user_fast", "idleDelayMs": 60000 },
       { "openId": "ou_user_slow", "idleDelayMs": 300000 }
     ],
+    "defaultIdleDelayMs": 900000,
     "askTtlMs": 86400000
   }
 }
@@ -269,9 +270,10 @@ Example:
 
 | Field | Description |
 |------|------|
-| `recipients` | Authoritative rollout list. Each item requires an app-scoped `openId` and a positive integer `idleDelayMs`. An empty array explicitly disables the survey for everyone. |
+| `recipients` | Authoritative explicit rollout list. Each item requires an app-scoped `openId` and a positive integer `idleDelayMs`. An empty array disables explicit recipients; with no `defaultIdleDelayMs`, it disables the survey for everyone. |
 | `recipients[].openId` | The requester eligible to receive a survey. Duplicate IDs keep the first valid rule. |
 | `recipients[].idleDelayMs` | Delay after the final reply. A new user message in the same session before this delay expires cancels the unsent survey. |
+| `defaultIdleDelayMs` | Optional positive integer fallback delay for a user requester who has no matching `recipients` entry. Explicit recipient rules take precedence. |
 | `askTtlMs` | How long the dispatched rating card remains answerable. Defaults to 24 hours. |
 
 Legacy `grayOpenIds` and the shared `idleDelayMs` remain readable for existing configurations. When `recipients` is present, it takes precedence and the legacy fields are ignored.
