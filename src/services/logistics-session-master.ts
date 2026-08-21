@@ -275,6 +275,9 @@ export class LogisticsSessionMasterManager {
     };
     this.records.set(masterKey, record);
     this.persist();
+    // The card has reached the user: create/update its master row immediately.
+    // Capture and semantic tagging update the same row asynchronously afterwards.
+    this.queueBaseSync(masterKey);
     this.queue(masterKey);
   }
 

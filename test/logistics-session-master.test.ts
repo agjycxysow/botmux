@@ -110,6 +110,30 @@ describe('logistics session master', () => {
     manager.stop();
   });
 
+  it('queues the master-row write at dispatch before a slow capture completes', async () => {
+    const dataDir = await makeDataDir();
+    const upsertBase = vi.fn(async () => ({ recordId: 'rec_dispatched' }));
+    const manager = new LogisticsSessionMasterManager({
+      dataDir,
+      larkAppId: 'cli_logistics',
+      config: {
+        enabled: true,
+        larkBase: { appToken: 'base_token', tableId: 'tbl_master', identity: 'user' },
+        modelTask: { enabled: true },
+      },
+      captureSession: vi.fn(() => new Promise<never>(() => undefined)),
+      upsertBase,
+    });
+    manager.start();
+    manager.noteSurveyDispatched(survey());
+    await vi.waitFor(() => expect(upsertBase).toHaveBeenCalledTimes(1));
+    expect(upsertBase.mock.calls[0]?.[0].record).toMatchObject({
+      taggingState: 'pending_capture',
+      surveyStatus: 'sent',
+    });
+    manager.stop();
+  });
+
   it('degrades failed model work to the review-safe fallback without losing the master row', async () => {
     const dataDir = await makeDataDir();
     const manager = new LogisticsSessionMasterManager({
