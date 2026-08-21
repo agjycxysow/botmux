@@ -191,6 +191,7 @@ export class LogisticsSessionMasterManager {
   private readonly jobs = new Map<string, Promise<void>>();
   private readonly baseSyncs = new Map<string, Promise<void>>();
   private readonly baseRetryTimers = new Map<string, NodeJS.Timeout>();
+  private baseWriteTail: Promise<void> = Promise.resolve();
   private started = false;
 
   constructor(private readonly options: LogisticsSessionMasterManagerOptions) {
@@ -406,7 +407,7 @@ export class LogisticsSessionMasterManager {
     const prior = this.baseSyncs.get(masterKey) ?? Promise.resolve();
     const run = prior
       .catch(() => undefined)
-      .then(() => this.upsertBase(masterKey))
+      .then(() => this.serializeBaseWrite(masterKey))
       .catch(error => {
         logger.warn(`[logistics-session-master] Base sync failed: ${error instanceof Error ? error.message : String(error)}`);
         this.scheduleBaseRetry(masterKey);
@@ -419,11 +420,24 @@ export class LogisticsSessionMasterManager {
 
   private async syncBaseBestEffort(masterKey: string): Promise<void> {
     try {
-      await this.upsertBase(masterKey);
+      await this.serializeBaseWrite(masterKey);
     } catch (error) {
       logger.warn(`[logistics-session-master] Base sync failed: ${error instanceof Error ? error.message : String(error)}`);
       this.scheduleBaseRetry(masterKey);
     }
+  }
+
+  /**
+   * Feishu Base rejects concurrent writes to the same table. Session processing
+   * may run in parallel, but every write for this bot's one master table stays
+   * in one FIFO chain.
+   */
+  private serializeBaseWrite(masterKey: string): Promise<void> {
+    const run = this.baseWriteTail
+      .catch(() => undefined)
+      .then(() => this.upsertBase(masterKey));
+    this.baseWriteTail = run.catch(() => undefined);
+    return run;
   }
 
   private scheduleBaseRetry(masterKey: string): void {

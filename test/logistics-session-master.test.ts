@@ -144,6 +144,48 @@ describe('logistics session master', () => {
     manager.stop();
   });
 
+  it('serializes Base writes from concurrent session processing', async () => {
+    const dataDir = await makeDataDir();
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const upsertBase = vi.fn(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise(resolve => setTimeout(resolve, 15));
+      inFlight -= 1;
+      return { recordId: `rec_${upsertBase.mock.calls.length}` };
+    });
+    const manager = new LogisticsSessionMasterManager({
+      dataDir,
+      larkAppId: 'cli_logistics',
+      config: {
+        enabled: true,
+        larkBase: { appToken: 'base_token', tableId: 'tbl_master', identity: 'user' },
+        modelTask: { enabled: true },
+      },
+      captureSession: vi.fn(async () => ({
+        transcript: '用户：问\n助手：答',
+        transcriptHash: 'c'.repeat(64),
+        captureState: 'complete' as const,
+        messageCount: 2,
+      })),
+      runModelTask: vi.fn(async () => ({
+        businessCategory: 'LB02',
+        problemType: 'LP03',
+        resolutionStatus: 'unknown' as const,
+        overallConfidence: 'medium' as const,
+        needsReview: false,
+      })),
+      upsertBase,
+    });
+    manager.start();
+    manager.noteSurveyDispatched(survey({ sessionId: 'session-a', chatId: 'oc_a' }));
+    manager.noteSurveyDispatched(survey({ sessionId: 'session-b', chatId: 'oc_b' }));
+    await vi.waitFor(() => expect(upsertBase.mock.calls.length).toBeGreaterThanOrEqual(4));
+    expect(maxInFlight).toBe(1);
+    manager.stop();
+  });
+
   it('stays inert until a complete Base binding is configured', () => {
     expect(normalizeLogisticsSessionMasterConfig({ enabled: true })).toMatchObject({
       enabled: false,
