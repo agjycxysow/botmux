@@ -53,7 +53,7 @@ import {
 } from './core/supervisor-shutdown-protocol.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, getMessageDetail, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, getMessageDetail, listChatMemberOpenIds, listThreadMessages, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -90,6 +90,15 @@ import {
   stopFeedbackSurveyManager,
 } from './services/feedback-survey.js';
 import { createFeedbackSurveyBaseUpserter } from './services/feedback-survey-base.js';
+import {
+  startLogisticsSessionMasterManager,
+  noteLogisticsSessionSurveyDispatched,
+  noteLogisticsSessionSurveySettled,
+  stopLogisticsSessionMasterManager,
+} from './services/logistics-session-master.js';
+import { createLogisticsSessionMasterBaseUpserter } from './services/logistics-session-master-base.js';
+import { buildLogisticsSessionSnapshot } from './services/logistics-session-capture.js';
+import { createLogisticsSessionModelTaskRunner } from './services/logistics-session-model-task.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
@@ -21305,6 +21314,52 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
 
   try {
+    startLogisticsSessionMasterManager({
+      dataDir: config.session.dataDir,
+      larkAppId: cfg.larkAppId,
+      config: cfg.logisticsSessionMaster,
+      captureSession: async ({ record, maxTranscriptChars }) => {
+        const session = sessionStore.getSession(record.sessionId);
+        const rawMessages = record.rootMessageId
+          ? await listThreadMessages(
+            record.larkAppId,
+            record.chatId,
+            record.rootMessageId,
+            0,
+          )
+          : [];
+        return buildLogisticsSessionSnapshot({
+          turnId: record.turnId,
+          answerMessageId: record.answerMessageId,
+          rootMessageId: record.rootMessageId,
+          sessionStartedAt: session?.createdAt,
+          maxTranscriptChars,
+          messages: rawMessages.map(raw => {
+            const parsed = parseApiMessage(raw);
+            return {
+              messageId: parsed.messageId,
+              senderType: parsed.senderType,
+              content: parsed.content,
+              createTime: parsed.createTime,
+            };
+          }),
+        });
+      },
+      upsertBase: createLogisticsSessionMasterBaseUpserter(),
+      runModelTask: createLogisticsSessionModelTaskRunner({
+        cliId: cfg.cliId,
+        cliPathOverride: cfg.cliPathOverride,
+        wrapperCli: cfg.wrapperCli,
+        model: cfg.logisticsSessionMaster?.modelTask?.model ?? cfg.model,
+        env: cfg.env,
+        timeoutMs: cfg.logisticsSessionMaster?.modelTask?.timeoutMs,
+      }),
+    });
+  } catch (err) {
+    logger.warn(`[logistics-session-master] startup failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  try {
     startFeedbackSurveyManager({
       dataDir: config.session.dataDir,
       larkAppId: cfg.larkAppId,
@@ -21317,6 +21372,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         return { chatId, content: parseApiMessage(raw).content };
       },
       upsertBase: createFeedbackSurveyBaseUpserter(),
+      // These hooks are intentionally best-effort inside FeedbackSurveyManager:
+      // a master-table problem cannot invalidate a successfully delivered card.
+      onDispatched: noteLogisticsSessionSurveyDispatched,
+      onSettled: noteLogisticsSessionSurveySettled,
     });
   } catch (err) {
     logger.warn(`[feedback-survey] startup failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -22562,6 +22621,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     scheduler.stopScheduler();
     stopFeedbackSurveyManager(cfg.larkAppId);
+    stopLogisticsSessionMasterManager(cfg.larkAppId);
     // NOTE: turn-terminal queue drain + webhook dispatcher stop are deliberately
     // deferred until AFTER workers have stopped producing (see below). Draining
     // here would close queue admission while worker terminal IPC handlers are

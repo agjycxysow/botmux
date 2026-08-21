@@ -1229,6 +1229,8 @@ export interface BotConfig {
   feedbackWebhooks?: { destinations: FeedbackWebhookDestination[] };
   /** Delayed post-turn survey. Missing or disabled stays inert. */
   feedbackSurvey?: FeedbackSurveyConfig;
+  /** Logistics session master row, triggered only after a survey card is sent. */
+  logisticsSessionMaster?: LogisticsSessionMasterConfig;
   /**
    * 租户品牌：`'feishu'`（中国版，open.feishu.cn）或 `'lark'`（国际版，
    * open.larksuite.com）。缺省 / 旧 bots.json 无此字段 → 视为 `'feishu'`
@@ -2908,6 +2910,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       feedbackSurvey: entry.feedbackSurvey === undefined
         ? undefined
         : normalizeFeedbackSurveyConfig(entry.feedbackSurvey),
+      logisticsSessionMaster: entry.logisticsSessionMaster === undefined
+        ? undefined
+        : normalizeLogisticsSessionMasterConfig(entry.logisticsSessionMaster),
       // brand：只认精确的 'lark'，其余 → undefined（下游 normalizeBrand 当
       // feishu）。feishu 故意存成 undefined，保持旧 bots.json 干净、不写死字段。
       brand: entry.brand === 'lark' ? 'lark' : undefined,

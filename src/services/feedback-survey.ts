@@ -159,6 +159,8 @@ export interface FeedbackSurveyManagerOptions {
   };
   getMessage(messageId: string): Promise<{ chatId: string; content: string }>;
   upsertBase?: FeedbackSurveyBaseUpsert;
+  onDispatched?: (record: FeedbackSurveyRecord) => void | Promise<void>;
+  onSettled?: (record: FeedbackSurveyRecord) => void | Promise<void>;
   now?: () => number;
 }
 
@@ -288,6 +290,12 @@ export class FeedbackSurveyManager {
     this.load();
     for (const record of this.records.values()) {
       if (record.status === 'scheduled') this.arm(record);
+      else if (record.status === 'sent'
+        || record.status === 'answered'
+        || record.status === 'timed_out'
+        || record.status === 'invalidated') {
+        void this.recoverPostDispatchHooks(record);
+      }
     }
   }
 
@@ -415,6 +423,9 @@ export class FeedbackSurveyManager {
           live.updatedAt = this.now();
           this.persist();
           this.queueBaseSync(live);
+          void Promise.resolve(this.options.onDispatched?.({ ...live })).catch(error => {
+            logger.warn(`feedback survey ${live.surveyId} post-dispatch hook failed: ${error instanceof Error ? error.message : String(error)}`);
+          });
         },
         onSettled: async (result) => {
           this.settleFromAsk(surveyId, result);
@@ -450,6 +461,9 @@ export class FeedbackSurveyManager {
     record.updatedAt = this.now();
     this.persist();
     this.queueBaseSync(record);
+    void Promise.resolve(this.options.onSettled?.({ ...record })).catch(error => {
+      logger.warn(`feedback survey ${record.surveyId} post-settlement hook failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
   }
 
   private cancel(record: FeedbackSurveyRecord, reason: string): void {
@@ -460,6 +474,19 @@ export class FeedbackSurveyManager {
     record.failureReason = reason;
     record.updatedAt = this.now();
     this.persist();
+  }
+
+  private async recoverPostDispatchHooks(record: FeedbackSurveyRecord): Promise<void> {
+    try {
+      await this.options.onDispatched?.({ ...record });
+      if (record.status === 'answered'
+        || record.status === 'timed_out'
+        || record.status === 'invalidated') {
+        await this.options.onSettled?.({ ...record });
+      }
+    } catch (error) {
+      logger.warn(`feedback survey ${record.surveyId} recovered post-dispatch hook failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   private recipientFor(openId: string): FeedbackSurveyRecipient | undefined {
