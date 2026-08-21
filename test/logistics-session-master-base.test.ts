@@ -72,6 +72,7 @@ describe('logistics session master Base upsert', () => {
       '总置信度': ['中'],
       '满意度': 5,
       '评价次数': 1,
+      '复核原因': '',
     });
   });
 

@@ -54,7 +54,7 @@ function fieldsForBase(record: LogisticsSessionMasterRecord): Record<string, unk
     '功能分组（LP）': select(problemLabel(record.problemType)),
     '解决状态': select(resolutionLabel(record.resolutionStatus)),
     '总置信度': select(confidenceLabel(record.overallConfidence)),
-    '待复核原因': record.reviewReason ?? '',
+    '复核原因': record.reviewReason ?? '',
     '满意度': record.rating ?? null,
     '评分状态': select(ratingStateLabel(record.ratingState)),
     '计划发送时间': formatShanghai(record.dueAt),
