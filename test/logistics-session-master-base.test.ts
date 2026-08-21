@@ -39,7 +39,7 @@ function record(overrides: Partial<LogisticsSessionMasterRecord> = {}): Logistic
 }
 
 describe('logistics session master Base upsert', () => {
-  it('looks up the business key then updates one existing master row with the existing taxonomy fields', async () => {
+  it('looks up the business key then batch-updates one existing master row with the existing taxonomy fields', async () => {
     const runner = vi.fn(async (_file: string, args: string[]) => {
       if (args.includes('+record-list')) {
         return {
@@ -61,14 +61,51 @@ describe('logistics session master Base upsert', () => {
     })).resolves.toEqual({ recordId: 'rec_existing' });
 
     const writeArgs = runner.mock.calls[1]![1] as string[];
-    expect(writeArgs).toEqual(expect.arrayContaining(['--record-id', 'rec_existing']));
-    const fields = JSON.parse(writeArgs[writeArgs.indexOf('--json') + 1]!) as Record<string, unknown>;
+    expect(writeArgs).toEqual(expect.arrayContaining(['+record-batch-update']));
+    const payload = JSON.parse(writeArgs[writeArgs.indexOf('--json') + 1]!) as {
+      update_records: Record<string, Record<string, unknown>>;
+    };
+    const fields = payload.update_records.rec_existing!;
     expect(fields).toMatchObject({
-      '业务分组（LB）': 'LB02 发货 / 履约',
-      '功能分组（LP）': 'LP03 页面 / 代码 / 接口链路定位',
-      '总置信度': '中',
+      '业务分组（LB）': ['LB02 发货 / 履约'],
+      '功能分组（LP）': ['LP03 页面 / 代码 / 接口链路定位'],
+      '总置信度': ['中'],
       '满意度': 5,
       '评价次数': 1,
+    });
+  });
+
+  it('batch-creates one master row when the business key is absent', async () => {
+    const runner = vi.fn(async (_file: string, args: string[]) => {
+      if (args.includes('+record-list')) {
+        return {
+          stdout: JSON.stringify({
+            data: {
+              fields: ['会话唯一键'],
+              data: [],
+              record_id_list: [],
+            },
+          }),
+        };
+      }
+      return { stdout: JSON.stringify({ data: { record_id_list: ['rec_created'] } }) };
+    });
+    const upsert = createLogisticsSessionMasterBaseUpserter(runner);
+    await expect(upsert({
+      config: { appToken: 'base_token', tableId: 'tbl_master', identity: 'user' },
+      record: record(),
+    })).resolves.toEqual({ recordId: 'rec_created' });
+
+    const writeArgs = runner.mock.calls[1]![1] as string[];
+    expect(writeArgs).toEqual(expect.arrayContaining(['+record-batch-create']));
+    const payload = JSON.parse(writeArgs[writeArgs.indexOf('--json') + 1]!) as {
+      create_records: Array<Record<string, unknown>>;
+    };
+    expect(payload.create_records).toHaveLength(1);
+    expect(payload.create_records[0]).toMatchObject({
+      '会话唯一键': 'oc_chat:session-1',
+      '问卷状态': ['已评分'],
+      '评分状态': ['已评分'],
     });
   });
 

@@ -31,8 +31,8 @@ function formatShanghai(value: number | undefined): string | null {
   return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}:${get('second')}`;
 }
 
-function select(value: string | undefined): string | null {
-  return value ?? null;
+function select(value: string | undefined): string[] | null {
+  return value ? [value] : null;
 }
 
 function fieldsForBase(record: LogisticsSessionMasterRecord): Record<string, unknown> {
@@ -150,6 +150,11 @@ function findRecordId(value: unknown): string | undefined {
   for (const key of ['record_id', 'recordId']) {
     if (typeof obj[key] === 'string' && obj[key]) return obj[key] as string;
   }
+  for (const key of ['record_id_list', 'recordIds']) {
+    if (Array.isArray(obj[key]) && typeof obj[key][0] === 'string' && obj[key][0]) {
+      return obj[key][0] as string;
+    }
+  }
   for (const child of Object.values(obj)) {
     const found = findRecordId(child);
     if (found) return found;
@@ -179,13 +184,22 @@ function findExactRecordIds(value: unknown, masterKey: string): string[] {
 }
 
 const defaultRunner: LogisticsSessionMasterBaseRunner = async (file, args, options) => {
-  const result = await execFileAsync(file, args, {
-    timeout: options.timeout,
-    maxBuffer: options.maxBuffer,
-    env: options.env,
-    encoding: 'utf8',
-  });
-  return { stdout: result.stdout };
+  try {
+    const result = await execFileAsync(file, args, {
+      timeout: options.timeout,
+      maxBuffer: options.maxBuffer,
+      env: options.env,
+      encoding: 'utf8',
+    });
+    return { stdout: result.stdout };
+  } catch (error) {
+    const code = typeof (error as { code?: unknown })?.code === 'number'
+      ? (error as { code: number }).code
+      : undefined;
+    throw new Error(code === undefined
+      ? 'lark-cli logistics session master request failed'
+      : `lark-cli logistics session master request failed (exit ${code})`);
+  }
 };
 
 async function runJson(
@@ -236,9 +250,27 @@ export function createLogisticsSessionMasterBaseUpserter(
       if (matches.length > 1) throw new Error('logistics_session_master_duplicate_key');
       recordId = matches[0];
     }
+    const fields = fieldsForBase(record);
+    if (recordId) {
+      await runJson(runner, [
+        'base',
+        '+record-batch-update',
+        '--as',
+        config.identity,
+        '--base-token',
+        config.appToken,
+        '--table-id',
+        config.tableId,
+        '--json',
+        JSON.stringify({ update_records: { [recordId]: fields } }),
+        '--format',
+        'json',
+      ]);
+      return { recordId };
+    }
     const written = await runJson(runner, [
       'base',
-      '+record-upsert',
+      '+record-batch-create',
       '--as',
       config.identity,
       '--base-token',
@@ -246,11 +278,10 @@ export function createLogisticsSessionMasterBaseUpserter(
       '--table-id',
       config.tableId,
       '--json',
-      JSON.stringify(fieldsForBase(record)),
+      JSON.stringify({ create_records: [fields] }),
       '--format',
       'json',
-      ...(recordId ? ['--record-id', recordId] : []),
     ]);
-    return { recordId: findRecordId(written) ?? recordId };
+    return { recordId: findRecordId(written) };
   };
 }
