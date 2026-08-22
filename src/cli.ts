@@ -136,7 +136,8 @@ import {
   startExactPm2ProcessIds,
   type Pm2ExactStartClient,
 } from './cli/pm2-exact-start.js';
-import { dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
+import { cliSendProviderUuid, dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments, type CliSendProviderUuidInput } from './cli/send-dispatch.js';
+import { claimCliSendFallbackProviderUuid, dispatchCliSendFallback } from './services/cli-send-idempotency.js';
 import { dispatchDeferredTopicSend, reusableDeferredTopicRoot, type DeferredScheduleRunData } from './cli/deferred-topic-send.js';
 import { readDeferredTopicBinding } from './core/deferred-topic-binding.js';
 import { resolveDaemonEnv } from './cli/daemon-lifecycle-env.js';
@@ -10177,10 +10178,92 @@ async function cmdSend(rest: string[]): Promise<void> {
   });
   let primaryQuotedId: string | null = null;
   let vcMeetingListenerReplyReplay = false;
+  // Card rendering may add live usage, feedback, and upload-derived resource
+  // keys. Those are presentation details, not a new send request. Freeze the
+  // CLI request shape before rendering so a host replay receives the same Lark
+  // provider UUID even when the rendered card changes between attempts.
+  const commandProviderIdentity = JSON.stringify({
+    content,
+    customCard: customCard ?? null,
+    images,
+    files,
+    videos: videoAttachments,
+    mentionArgs,
+    mentionBack,
+    noMention,
+    responseKind: effectiveResponseKind,
+    asVoice,
+    isSlashSend,
+    sendTopLevel,
+    overrideChatId: overrideChatId ?? null,
+    sendInto: sendInto ?? null,
+    noQuote,
+    explicitQuote: explicitQuote ?? null,
+    attention,
+  });
+  const providerUuid = (input: CliSendProviderUuidInput): string | undefined => {
+    const managedUuid = cliSendProviderUuid(input);
+    if (managedUuid || process.env.BOTMUX_SESSION_ID !== sid) return managedUuid;
+    return claimCliSendFallbackProviderUuid({
+      dataDir: sendDataDir,
+      sessionId: sid,
+      requestIdentity: JSON.stringify({
+        appId: input.appId,
+        targetChatId: input.targetChatId,
+        quoteTargetId: input.quoteTargetId ?? null,
+        threadRootId: input.threadRootId ?? null,
+        content: input.content,
+        msgType: input.msgType,
+      }),
+    });
+  };
+  const directFallbackInput = (
+    input: CliSendProviderUuidInput,
+  ): { dataDir: string; sessionId: string; requestIdentity: string } | undefined => {
+    if (cliSendProviderUuid(input) || process.env.BOTMUX_SESSION_ID !== sid) return undefined;
+    return {
+      dataDir: sendDataDir,
+      sessionId: sid,
+      requestIdentity: JSON.stringify({
+        appId: input.appId,
+        targetChatId: input.targetChatId,
+        quoteTargetId: input.quoteTargetId ?? null,
+        threadRootId: input.threadRootId ?? null,
+        content: input.content,
+        msgType: input.msgType,
+      }),
+    };
+  };
+  const attachmentProviderUuid = ({
+    kind,
+    index,
+    source,
+    msgType,
+    isPrimary = false,
+  }: {
+    kind: 'file' | 'video';
+    index: number;
+    source: Record<string, unknown>;
+    msgType: 'file' | 'media';
+    isPrimary?: boolean;
+  }): string | undefined => providerUuid({
+    sessionId: sid,
+    turnId: currentTurnId,
+    appId,
+    targetChatId,
+    quoteTargetId: isPrimary ? quoteTargetId ?? undefined : undefined,
+    threadRootId: sendTarget.mode === 'plain' ? undefined : sendTarget.rootMessageId,
+    // Provider attachment keys are generated afresh on each upload. Hash the
+    // original command body and source attachment instead, so retries reuse
+    // Lark's one-hour idempotency key even when file/image keys differ.
+    content: JSON.stringify({ commandProviderIdentity, kind, index, source }),
+    msgType,
+  });
   const dispatchPrimary = async (
     content: string,
     msgType: string,
     originAlreadyRevalidated = false,
+    providerUuidOverride?: string,
   ): Promise<string> => {
     // `dispatchPrimaryMessage` may call replyMessage directly for a quote, so
     // fence immediately before preparing/performing that primary effect too.
@@ -10216,7 +10299,24 @@ async function cmdSend(rest: string[]): Promise<void> {
     } else if (prepared?.kind === 'send') {
       vcMeetingListenerReplyReplay = prepared.replay;
     }
-    const result = await dispatchPrimaryMessage(
+    const primaryProviderInput = {
+      sessionId: sid,
+      turnId: currentTurnId,
+      appId,
+      targetChatId: canonicalOutput.targetChatId,
+      quoteTargetId: canonicalOutput.quoteTargetId,
+      threadRootId: sendTarget.mode === 'plain' ? undefined : sendTarget.rootMessageId,
+      content: commandProviderIdentity,
+      msgType: canonicalOutput.msgType,
+    } satisfies CliSendProviderUuidInput;
+    const directFallback = !prepared && !providerUuidOverride
+      ? directFallbackInput(primaryProviderInput)
+      : undefined;
+    const primaryProviderUuid = prepared?.providerKey ?? providerUuidOverride ?? cliSendProviderUuid(primaryProviderInput);
+    const sendPrimary = async (
+      uuid: string | undefined,
+      suppressHook = false,
+    ) => dispatchPrimaryMessage(
       { sendMessage, replyMessage },
       {
         appId,
@@ -10224,10 +10324,10 @@ async function cmdSend(rest: string[]): Promise<void> {
         quoteTargetId: canonicalOutput.quoteTargetId,
         content: canonicalOutput.content,
         msgType: canonicalOutput.msgType,
-        ...(prepared ? { uuid: prepared.providerKey } : {}),
+        ...(uuid ? { uuid } : {}),
         // Managed meeting output must never fan out through user-configured
         // outbound hooks, including its first provider attempt.
-        ...(prepared ? { suppressHook: true } : {}),
+        ...(prepared || suppressHook ? { suppressHook: true } : {}),
         hookContext,
         MessageWithdrawnError,
         ...(isolatedHookOrigin
@@ -10265,6 +10365,15 @@ async function cmdSend(rest: string[]): Promise<void> {
         },
       },
     );
+    const result = directFallback
+      ? await dispatchCliSendFallback(
+          directFallback,
+          (uuid, replay) => sendPrimary(uuid, replay).then(sent => sent.messageId),
+        ).then(({ messageId }) => ({
+          messageId,
+          primaryQuotedId: canonicalOutput.quoteTargetId ?? null,
+        }))
+      : await sendPrimary(primaryProviderUuid);
     primaryQuotedId = result.primaryQuotedId;
     if (prepared?.kind === 'send' || prepared?.kind === 'succeeded') {
       finishVcMeetingImReply(resolveDataDir(), prepared.ref, result.messageId);
@@ -10492,7 +10601,18 @@ async function cmdSend(rest: string[]): Promise<void> {
           uploadFile,
           uploadImage,
           dispatch: dispatchAfterOriginGate,
-          primaryDispatch: (body, type) => dispatchPrimary(body, type, true),
+          primaryDispatch: (body, type, uuid) => dispatchPrimary(body, type, true, uuid),
+          providerUuid: (video, index, isPrimary) => attachmentProviderUuid({
+            kind: 'video',
+            index,
+            source: {
+              videoPath: video.videoPath,
+              coverPath: video.coverPath,
+              durationMs: video.durationMs,
+            },
+            msgType: 'media',
+            isPrimary,
+          }),
           beforeEffect: fenceIsolatedOriginBeforeEffect,
           ...(vcMeetingManagedSendOrigin ? { maxMessages: 1 } : {}),
         },
@@ -10675,10 +10795,40 @@ async function cmdSend(rest: string[]): Promise<void> {
     // surface as command failure.
     if (!pureVideoSend && !vcMeetingListenerReplyReplay) {
       ({ failed: failedAttachments } = await sendFileAttachments(
-        { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, files,
+        {
+          uploadFile,
+          dispatch: dispatchAfterOriginGate,
+          providerUuid: (filePath, index) => attachmentProviderUuid({
+            kind: 'file',
+            index,
+            source: { filePath },
+            msgType: 'file',
+          }),
+          beforeEffect: fenceIsolatedOriginBeforeEffect,
+        },
+        appId,
+        files,
       ));
       const videoResult = await sendVideoAttachments(
-        { uploadFile, uploadImage, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, videoAttachments,
+        {
+          uploadFile,
+          uploadImage,
+          dispatch: dispatchAfterOriginGate,
+          providerUuid: (video, index, isPrimary) => attachmentProviderUuid({
+            kind: 'video',
+            index,
+            source: {
+              videoPath: video.videoPath,
+              coverPath: video.coverPath,
+              durationMs: video.durationMs,
+            },
+            msgType: 'media',
+            isPrimary,
+          }),
+          beforeEffect: fenceIsolatedOriginBeforeEffect,
+        },
+        appId,
+        videoAttachments,
       );
       failedVideoAttachments = videoResult.failed;
     }

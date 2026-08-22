@@ -25,6 +25,7 @@
  * The worker resolves every impure input up front (realpath, existence
  * filtering, sibling-free by design) and passes canonical absolute paths.
  */
+import { cliSendIdempotencySessionDir } from '../../services/cli-send-idempotency.js';
 
 export type FsAccess = 'readWrite' | 'readOnly' | 'deny';
 export type FsRuleSource = 'baseline' | 'adapter' | 'internal' | 'user' | 'mandatory';
@@ -814,6 +815,10 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // worker PRE-CREATES this file before spawn so it survives the existence
   // filter and bwrap can bind it (bwrap cannot bind a nonexistent source).
   if (ctx.sessionId) push([`${sd}/turn-sends/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
+  // Direct CLI sends can lack an authenticated turn id (for example Code X
+  // tool calls). Keep their replay window state in an own-session directory so
+  // the lock and atomic rewrite stay available without exposing sibling data.
+  if (ctx.sessionId) push([cliSendIdempotencySessionDir(sd, ctx.sessionId)], 'readWrite', 'internal');
   // (schedules: stored PER BOT inside each BOT_HOME — the owner's dir is
   // already readWrite above and siblings' stores are denied by construction,
   // so the old shared data/schedules.json grant (and the cross-bot task-prompt
@@ -908,7 +913,12 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       // no separate authority-root concern.
       `${ctx.sessionDataDir}/bin`,
     ], 'readOnly', 'internal');
-    if (ctx.sessionId) push([`${ctx.sessionDataDir}/turn-sends/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
+    if (ctx.sessionId) {
+      push([
+        `${ctx.sessionDataDir}/turn-sends/${ctx.sessionId}.jsonl`,
+        cliSendIdempotencySessionDir(ctx.sessionDataDir, ctx.sessionId),
+      ], 'readWrite', 'internal');
+    }
     // NOTE: dashboard-daemons (sibling IPC port table) and .dashboard-secret/-token
     // are deliberately NOT re-allowed — a no-transport turn has no business
     // reaching sibling daemons, and the secret is the escalation vector.

@@ -1,5 +1,42 @@
+import { createHash } from 'node:crypto';
 import { extname } from 'node:path';
 import type { ManagedHookOrigin } from '../services/hook-runner.js';
+
+export type CliSendProviderUuidInput = {
+  sessionId: string;
+  turnId?: string;
+  appId: string;
+  targetChatId: string;
+  quoteTargetId?: string;
+  threadRootId?: string;
+  content: string;
+  msgType: string;
+};
+
+/**
+ * Build the Feishu UUID for a normal `botmux send` provider effect.
+ *
+ * A managed turn can be replayed by its host after the command has already
+ * reached Lark. Keep the UUID stable for that exact turn, payload, and target
+ * so Lark returns the original message instead of creating a second one.
+ * Manual sends do not have an authoritative turn identity and retain their
+ * historical non-deduplicated behavior.
+ */
+export function cliSendProviderUuid(input: CliSendProviderUuidInput): string | undefined {
+  if (!input.turnId) return undefined;
+  const identity = JSON.stringify({
+    v: 1,
+    sessionId: input.sessionId,
+    turnId: input.turnId,
+    appId: input.appId,
+    targetChatId: input.targetChatId,
+    quoteTargetId: input.quoteTargetId ?? null,
+    threadRootId: input.threadRootId ?? null,
+    content: input.content,
+    msgType: input.msgType,
+  });
+  return `bms_${createHash('sha256').update(identity).digest('hex').slice(0, 46)}`;
+}
 
 export type SendMessageFn = (
   larkAppId: string,
@@ -82,7 +119,9 @@ export function validateSlashSend(raw: string): SlashSendValidation {
 
 export type SendFileAttachmentsDeps = {
   uploadFile: (appId: string, path: string) => Promise<string>;
-  dispatch: (content: string, msgType: string) => Promise<string>;
+  dispatch: (content: string, msgType: string, uuid?: string) => Promise<string>;
+  /** Stable provider key for this source attachment when a managed turn replays. */
+  providerUuid?: (path: string, index: number) => string | undefined;
   beforeEffect?: () => void | Promise<void>;
 };
 
@@ -106,12 +145,16 @@ export async function sendFileAttachments(
 ): Promise<SendFileAttachmentsResult> {
   const sent: string[] = [];
   const failed: { path: string; error: string }[] = [];
-  for (const fp of files) {
+  for (const [index, fp] of files.entries()) {
     try {
       await deps.beforeEffect?.();
       const fileKey = await deps.uploadFile(appId, fp);
       await deps.beforeEffect?.();
-      sent.push(await deps.dispatch(JSON.stringify({ file_key: fileKey }), 'file'));
+      const content = JSON.stringify({ file_key: fileKey });
+      const uuid = deps.providerUuid?.(fp, index);
+      sent.push(await (uuid
+        ? deps.dispatch(content, 'file', uuid)
+        : deps.dispatch(content, 'file')));
     } catch (err: any) {
       failed.push({ path: fp, error: err?.message ?? String(err) });
     }
@@ -350,14 +393,16 @@ export function normalizeInteractiveCardInput(raw: string): NormalizedInteractiv
 export type SendVideoAttachmentsDeps = {
   uploadFile: (appId: string, path: string) => Promise<string>;
   uploadImage: (appId: string, path: string) => Promise<string>;
-  dispatch: (content: string, msgType: string) => Promise<string>;
+  dispatch: (content: string, msgType: string, uuid?: string) => Promise<string>;
   // Optional: dispatch used for the FIRST successfully-sent video only. A
   // pure-video send (no text/card primary) has no other message to carry the
   // quote/reply chain, so its first media message must go through the primary
   // dispatch (which applies the chat-scope quoteTargetId) to stay consistent
   // with card/file/image sends. Later videos remain best-effort via `dispatch`.
   // Omitted for secondary sends (card is already the primary) → all use `dispatch`.
-  primaryDispatch?: (content: string, msgType: string) => Promise<string>;
+  primaryDispatch?: (content: string, msgType: string, uuid?: string) => Promise<string>;
+  /** Stable provider key for this source attachment when a managed turn replays. */
+  providerUuid?: (video: VideoAttachmentInput, index: number, isPrimary: boolean) => string | undefined;
   /** Optional hard cap checked before any upload/dispatch. Managed VC pure-video
    * replies set this to one because only the primary media message has a durable
    * action/provider identity; later bare media sends would duplicate on replay. */
@@ -386,7 +431,7 @@ export async function sendVideoAttachments(
   // every later one uses plain `dispatch`. Tracked on success only, so if the
   // first video's upload fails the next one inherits the primary slot.
   let primaryUsed = false;
-  for (const video of videos) {
+  for (const [index, video] of videos.entries()) {
     try {
       await deps.beforeEffect?.();
       const fileKey = await deps.uploadFile(appId, video.videoPath);
@@ -397,9 +442,13 @@ export async function sendVideoAttachments(
         image_key: imageKey,
         duration: video.durationMs,
       });
-      const send = (!primaryUsed && deps.primaryDispatch) ? deps.primaryDispatch : deps.dispatch;
+      const isPrimary = !primaryUsed && !!deps.primaryDispatch;
+      const send = isPrimary ? deps.primaryDispatch! : deps.dispatch;
+      const uuid = deps.providerUuid?.(video, index, isPrimary);
       await deps.beforeEffect?.();
-      const messageId = await send(content, 'media');
+      const messageId = await (uuid
+        ? send(content, 'media', uuid)
+        : send(content, 'media'));
       primaryUsed = true;
       sent.push(messageId);
     } catch (err: any) {

@@ -240,10 +240,12 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/bot-openids-cli_self.json').access).toBe('readOnly'); // own
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('readOnly');     // own
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends/s.jsonl').access).toBe('readWrite');        // OWN session marker only
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/cli-send-idempotency/043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89/replay.json').access).toBe('readWrite');
     // blocker #4: turn-sends is granted per-session-FILE, not the whole dir —
     // another session's marker is NOT writable (can't corrupt its send-dedup).
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends/other.jsonl').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/cli-send-idempotency/other/replay.json').access).toBe('none');
     // own BOT_HOME rw + own attachments ro (allow-listed elsewhere)
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_self/claude/x').access).toBe('readWrite');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/attachments/cli_self/m/f.pdf').access).toBe('readWrite'); // botmux quoted downloads here

@@ -81,6 +81,26 @@ describe('cmdSend hook context wiring', () => {
     expect(cliSource).toMatch(/replyMessage\(\s*appId,\s*sendTarget\.rootMessageId,\s*content,\s*msgType,\s*sendTarget\.mode === 'thread',\s*uuid,\s*hookContext,/);
   });
 
+  it('derives provider UUIDs for normal managed-turn messages and attachments', () => {
+    expect(cliSource).toContain('const providerUuid = (input: CliSendProviderUuidInput): string | undefined => {');
+    expect(cliSource).toContain('const managedUuid = cliSendProviderUuid(input);');
+    expect(cliSource).toContain('claimCliSendFallbackProviderUuid({');
+    expect(cliSource).toContain('const directFallbackInput = (');
+    expect(cliSource).toContain('const primaryProviderInput = {');
+    expect(cliSource).toContain('const directFallback = !prepared && !providerUuidOverride');
+    expect(cliSource).toContain('await dispatchCliSendFallback(');
+    expect(cliSource).toContain('const primaryProviderUuid = prepared?.providerKey ?? providerUuidOverride ?? cliSendProviderUuid(primaryProviderInput);');
+    expect(cliSource).toContain('turnId: currentTurnId,');
+    expect(cliSource).toContain('const commandProviderIdentity = JSON.stringify({');
+    expect(cliSource).toContain('mentionBack,');
+    expect(cliSource).toContain('noMention,');
+    expect(cliSource).toContain('content: commandProviderIdentity,');
+    expect(cliSource).toContain('...(uuid ? { uuid } : {}),');
+    expect(cliSource).toContain('const attachmentProviderUuid = ({');
+    expect(cliSource).toContain('providerUuid: (filePath, index) => attachmentProviderUuid({');
+    expect(cliSource).toContain('providerUuid: (video, index, isPrimary) => attachmentProviderUuid({');
+  });
+
   it('resolves mention-back from the exact turn instead of the latest queued sender', () => {
     expect(cliSource).toContain(
       'const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId',
@@ -523,7 +543,7 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toMatch(/sessionQuoteTargetId: vcMeetingDeliveryReplyOrigin\s*\? undefined/);
     expect(cmdSend).toContain('const prepared = prepareVcMeetingListenerReply(proposedOutput);');
     expect(cmdSend).toMatch(/canonicalOutput\.msgType,[\s\S]*?prepared\?\.providerKey/);
-    expect(cmdSend).toContain('...(prepared ? { suppressHook: true } : {})');
+    expect(cmdSend).toContain('...(prepared || suppressHook ? { suppressHook: true } : {})');
     expect(cmdSend).toContain('const managedProviderOptions = outboundMessageOptions(!!prepared);');
     expect(cmdSend).toContain('...(vcMeetingManagedSendOrigin ? { maxMessages: 1 } : {})');
   });

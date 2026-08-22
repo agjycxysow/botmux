@@ -53,6 +53,7 @@ import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
 import { readProcessStartIdentity } from './core/session-marker.js';
 import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
+import { cliSendIdempotencySessionDir } from './services/cli-send-idempotency.js';
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from './services/bridge-turn-queue.js';
 import { bridgePostText, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, structuredFallbackKind, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
@@ -13911,6 +13912,9 @@ async function spawnCli(
     //    marker. The policy grants ONLY this exact file (not the whole dir) so a
     //    sandboxed CLI can't rewrite another session's marker — pre-create the
     //    file itself (touch) so the single-file bind has a source.
+    //  - data/cli-send-idempotency/<hash(sessionId)>: direct `botmux send`
+    //    replay state, kept per-session so the sandbox can lock/rewrite only
+    //    its own records.
     //  - data/attachments/<self>: `botmux quoted`/downloadResources writes here
     // (BOT_HOME + outbox are created elsewhere.) Best-effort — a failure just
     // reverts to the pre-existing drop behaviour.
@@ -13920,6 +13924,7 @@ async function spawnCli(
       const tsFile = join(tsDir, `${cfg.sessionId}.jsonl`);
       if (!existsSync(tsFile)) writeFileSync(tsFile, '');
     } catch { /* */ }
+    try { mkdirSync(cliSendIdempotencySessionDir(dataDir, cfg.sessionId), { recursive: true, mode: 0o700 }); } catch { /* */ }
     // UserPromptSubmit sidecar 目录（#794）：daemon 逐 turn 写入，沙盒内 hook 只读。
     try { mkdirSync(join(dataDir, 'prompt-ctx', cfg.sessionId), { recursive: true, mode: 0o700 }); } catch { /* */ }
     try { mkdirSync(join(dataDir, 'attachments', cfg.larkAppId), { recursive: true }); } catch { /* */ }

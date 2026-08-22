@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  cliSendProviderUuid,
   dispatchPrimaryMessage,
   findStdinAliasAttachment,
   normalizeInteractiveCardInput,
@@ -11,6 +12,39 @@ import {
 } from '../src/cli/send-dispatch.js';
 
 class MessageWithdrawnError extends Error {}
+
+describe('cliSendProviderUuid', () => {
+  const base = {
+    sessionId: 'session-1',
+    turnId: 'turn-1',
+    appId: 'cli_app',
+    targetChatId: 'oc_chat',
+    quoteTargetId: 'om_quote',
+    content: 'same reply',
+    msgType: 'interactive',
+  };
+
+  it('returns a stable provider UUID for a replayed turn send', () => {
+    const first = cliSendProviderUuid(base);
+    const replay = cliSendProviderUuid({ ...base });
+
+    expect(first).toBe(replay);
+    expect(first).toMatch(/^bms_[a-f0-9]{46}$/);
+    expect(first).toHaveLength(50);
+  });
+
+  it('changes the provider UUID when the turn or delivered payload changes', () => {
+    const original = cliSendProviderUuid(base);
+
+    expect(cliSendProviderUuid({ ...base, turnId: 'turn-2' })).not.toBe(original);
+    expect(cliSendProviderUuid({ ...base, content: 'different reply' })).not.toBe(original);
+    expect(cliSendProviderUuid({ ...base, quoteTargetId: undefined })).not.toBe(original);
+  });
+
+  it('does not opt manual sends without an authoritative turn into deduplication', () => {
+    expect(cliSendProviderUuid({ ...base, turnId: undefined })).toBeUndefined();
+  });
+});
 
 describe('dispatchPrimaryMessage hook context wiring', () => {
   const baseOptions = {
@@ -191,6 +225,23 @@ describe('sendFileAttachments (best-effort, never throws after primary send)', (
       'om:{"file_key":"key:/b"}',
     ]);
     expect(uploadFile).toHaveBeenCalledTimes(2);
+  });
+
+  it('passes one stable provider UUID per file attachment', async () => {
+    const uploadFile = vi.fn(async (_app: string, p: string) => `key:${p}`);
+    const dispatch = vi.fn(async (content: string) => `om:${content}`);
+    const providerUuid = vi.fn((path: string, index: number) => `bms_file_${index}_${path}`);
+
+    await sendFileAttachments(
+      { uploadFile, dispatch, providerUuid },
+      'cli_app',
+      ['/a', '/b'],
+    );
+
+    expect(providerUuid).toHaveBeenNthCalledWith(1, '/a', 0);
+    expect(providerUuid).toHaveBeenNthCalledWith(2, '/b', 1);
+    expect(dispatch).toHaveBeenNthCalledWith(1, '{"file_key":"key:/a"}', 'file', 'bms_file_0_/a');
+    expect(dispatch).toHaveBeenNthCalledWith(2, '{"file_key":"key:/b"}', 'file', 'bms_file_1_/b');
   });
 
   it('captures a failing attachment without throwing and still sends the others', async () => {
@@ -499,6 +550,50 @@ describe('sendVideoAttachments (best-effort media messages)', () => {
     expect(dispatch).toHaveBeenCalledWith(
       '{"file_key":"file:/tmp/replay.mp4","image_key":"image:/tmp/cover.png","duration":0}',
       'media',
+    );
+  });
+
+  it('passes deterministic UUIDs to primary and follow-up video dispatches', async () => {
+    const uploadFile = vi.fn(async (_app: string, p: string) => `file:${p}`);
+    const uploadImage = vi.fn(async (_app: string, p: string) => `image:${p}`);
+    const primaryDispatch = vi.fn(async (content: string) => `primary:${content}`);
+    const dispatch = vi.fn(async (content: string) => `plain:${content}`);
+    const providerUuid = vi.fn((
+      video: { videoPath: string },
+      index: number,
+      isPrimary: boolean,
+    ) => `bms_video_${index}_${isPrimary ? 'primary' : 'followup'}_${video.videoPath}`);
+
+    await sendVideoAttachments(
+      { uploadFile, uploadImage, dispatch, primaryDispatch, providerUuid },
+      'cli_app',
+      [
+        { videoPath: '/tmp/a.mp4', coverPath: '/tmp/a.png', durationMs: 0 },
+        { videoPath: '/tmp/b.mp4', coverPath: '/tmp/b.png', durationMs: 0 },
+      ],
+    );
+
+    expect(providerUuid).toHaveBeenNthCalledWith(
+      1,
+      { videoPath: '/tmp/a.mp4', coverPath: '/tmp/a.png', durationMs: 0 },
+      0,
+      true,
+    );
+    expect(providerUuid).toHaveBeenNthCalledWith(
+      2,
+      { videoPath: '/tmp/b.mp4', coverPath: '/tmp/b.png', durationMs: 0 },
+      1,
+      false,
+    );
+    expect(primaryDispatch).toHaveBeenCalledWith(
+      '{"file_key":"file:/tmp/a.mp4","image_key":"image:/tmp/a.png","duration":0}',
+      'media',
+      'bms_video_0_primary_/tmp/a.mp4',
+    );
+    expect(dispatch).toHaveBeenCalledWith(
+      '{"file_key":"file:/tmp/b.mp4","image_key":"image:/tmp/b.png","duration":0}',
+      'media',
+      'bms_video_1_followup_/tmp/b.mp4',
     );
   });
 
