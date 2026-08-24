@@ -53,7 +53,7 @@ import {
 } from './core/supervisor-shutdown-protocol.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, listChatMemberOpenIds, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, getMessageDetail, listChatMemberOpenIds, listThreadMessages, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -82,6 +82,23 @@ import { setDisplayNameRefresher, findConfigField, applyConfigField } from './se
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
+import {
+  getFeedbackSurveyOutboundDelivery,
+  noteFeedbackUserActivity,
+  scheduleFeedbackSurveyForTurn,
+  startFeedbackSurveyManager,
+  stopFeedbackSurveyManager,
+} from './services/feedback-survey.js';
+import { createFeedbackSurveyBaseUpserter } from './services/feedback-survey-base.js';
+import {
+  startLogisticsSessionMasterManager,
+  noteLogisticsSessionSurveyDispatched,
+  noteLogisticsSessionSurveySettled,
+  stopLogisticsSessionMasterManager,
+} from './services/logistics-session-master.js';
+import { createLogisticsSessionMasterBaseUpserter } from './services/logistics-session-master-base.js';
+import { buildLogisticsSessionSnapshot } from './services/logistics-session-capture.js';
+import { createLogisticsSessionModelTaskRunner } from './services/logistics-session-model-task.js';
 import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
@@ -94,7 +111,7 @@ import { migrateOverloadAlertAtStartup } from './services/overload-alert-migrati
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
-import { createImgNumberer, extractPostAtParticipants, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { createImgNumberer, extractPostAtParticipants, parseApiMessage, parseEventMessage, resolveNonsupportMessage, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
 import { buildQuoteHint } from './im/lark/quote-hint.js';
@@ -471,6 +488,7 @@ import {
   setCanTalkChecker as setAskCanTalkChecker,
   setAskPersistStore as setAskPersistStoreBroker,
   registerAsk as registerAskBroker,
+  registerAskWithHandle as registerAskWithHandleBroker,
   restorePersistedAsks as restorePersistedAsksBroker,
   findPendingAskByAnchor,
   submitCustomReply,
@@ -3300,10 +3318,18 @@ export async function noteTurnReceived(
   ds: DaemonSession,
   triggerMessageId: string,
   _prompt?: string,
-  _sender?: { name?: string },
+  _sender?: ResolvedSender,
   _turnId?: string,
   receivedReactionEmoji?: string,
 ): Promise<void> {
+  if (_sender?.type === 'user') {
+    noteFeedbackUserActivity({
+      larkAppId: ds.larkAppId,
+      sessionId: ds.session.sessionId,
+      turnId: _turnId ?? triggerMessageId,
+      senderOpenId: _sender.openId,
+    });
+  }
   // Replaces the old 「处理中」 placeholder card. That card existed only to be
   // PATCHed with the final answer, and `im.v1.message.patch` is silent (no Feishu
   // notification / unread) — so card-off answers could land unseen. The
@@ -3341,6 +3367,30 @@ export async function noteTurnReceived(
     return;
   }
   (ds.pendingAckReactions ??= []).push({ messageId: triggerMessageId, reactionId });
+}
+
+function scheduleFeedbackForCompletedTurn(
+  ds: DaemonSession,
+  turnId: string | undefined,
+  answerMessageId?: string,
+): void {
+  if (
+    !turnId
+    || ds.session.vcMeetingReceiver
+    || ds.session.deferredScheduleRun
+    || ds.managedTurnOrigin?.dispatchAttempt !== undefined
+  ) return;
+  scheduleFeedbackSurveyForTurn({
+    larkAppId: ds.larkAppId,
+    sessionId: ds.session.sessionId,
+    turnId,
+    chatId: ds.chatId,
+    rootMessageId: ds.scope === 'chat' ? null : ds.session.rootMessageId,
+    chatType: ds.chatType,
+    title: ds.currentTurnTitle ?? ds.session.title,
+    cliId: ds.session.cliId,
+    answerMessageId,
+  });
 }
 
 async function sessionReply(
@@ -3405,23 +3455,31 @@ async function sessionReply(
   const outboundOptions = opts?.suppressHook || ds?.session.vcMeetingReceiver
     ? { suppressHook: true }
     : undefined;
+  const recordFeedbackDelivery = (messageId: string): string => {
+    if (ds && (msgType === 'text' || msgType === 'interactive')) {
+      scheduleFeedbackForCompletedTurn(ds, turnId, messageId);
+    }
+    return messageId;
+  };
   const sendWithHookPolicy = (
     chatId: string,
     body: string,
     type: string,
     uuid?: string,
-  ): Promise<string> => outboundOptions
+  ): Promise<string> => (outboundOptions
     ? sendMessage(appId, chatId, body, type, uuid, hookContext, outboundOptions)
-    : sendMessage(appId, chatId, body, type, uuid, hookContext);
+    : sendMessage(appId, chatId, body, type, uuid, hookContext)
+  ).then(recordFeedbackDelivery);
   const replyWithHookPolicy = (
     messageId: string,
     body: string,
     type: string,
     replyInThread: boolean,
     uuid?: string,
-  ): Promise<string> => outboundOptions
+  ): Promise<string> => (outboundOptions
     ? replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext, outboundOptions)
-    : replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext);
+    : replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext)
+  ).then(recordFeedbackDelivery);
 
   // Chat-scope: post a plain message to the chat. No reply_in_thread → keeps
   // the conversation flat in 普通群. The card layer carries chatId in its button
@@ -6398,6 +6456,21 @@ ipcRoute('POST', '/api/hooks/emit', async (req, res) => {
         ? null
         : ds!.session.rootMessageId,
     });
+  }
+  const feedbackDelivery = getFeedbackSurveyOutboundDelivery(
+    event,
+    boundPayload,
+    typeof originTurnId === 'string' ? originTurnId : undefined,
+  );
+  if (feedbackDelivery) {
+    const feedbackSession = findActiveBySessionId(feedbackDelivery.sessionId);
+    if (feedbackSession && feedbackSession.larkAppId === boundPayload.larkAppId) {
+      scheduleFeedbackForCompletedTurn(
+        feedbackSession,
+        feedbackDelivery.turnId,
+        feedbackDelivery.answerMessageId,
+      );
+    }
   }
   emitHookEventLocal(event as HookEvent, boundPayload);
   return jsonRes(res, 202, { ok: true });
@@ -21251,6 +21324,74 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.warn(`[ask] restorePersistedAsks failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
+  try {
+    startLogisticsSessionMasterManager({
+      dataDir: config.session.dataDir,
+      larkAppId: cfg.larkAppId,
+      config: cfg.logisticsSessionMaster,
+      captureSession: async ({ record, maxTranscriptChars }) => {
+        const session = sessionStore.getSession(record.sessionId);
+        const rawMessages = record.rootMessageId
+          ? await listThreadMessages(
+            record.larkAppId,
+            record.chatId,
+            record.rootMessageId,
+            0,
+          )
+          : [];
+        return buildLogisticsSessionSnapshot({
+          turnId: record.turnId,
+          answerMessageId: record.answerMessageId,
+          rootMessageId: record.rootMessageId,
+          sessionStartedAt: session?.createdAt,
+          maxTranscriptChars,
+          messages: rawMessages.map(raw => {
+            const parsed = parseApiMessage(raw);
+            return {
+              messageId: parsed.messageId,
+              senderType: parsed.senderType,
+              content: parsed.content,
+              createTime: parsed.createTime,
+            };
+          }),
+        });
+      },
+      upsertBase: createLogisticsSessionMasterBaseUpserter(),
+      runModelTask: createLogisticsSessionModelTaskRunner({
+        cliId: cfg.cliId,
+        cliPathOverride: cfg.cliPathOverride,
+        wrapperCli: cfg.wrapperCli,
+        model: cfg.logisticsSessionMaster?.modelTask?.model ?? cfg.model,
+        env: cfg.env,
+        timeoutMs: cfg.logisticsSessionMaster?.modelTask?.timeoutMs,
+      }),
+    });
+  } catch (err) {
+    logger.warn(`[logistics-session-master] startup failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  try {
+    startFeedbackSurveyManager({
+      dataDir: config.session.dataDir,
+      larkAppId: cfg.larkAppId,
+      config: cfg.feedbackSurvey,
+      registerAsk: registerAskWithHandleBroker,
+      getMessage: async (messageId) => {
+        const detail = await getMessageDetail(cfg.larkAppId, messageId, { userCardContent: true });
+        const raw = detail?.items?.[0] ?? detail?.message ?? detail;
+        const chatId = raw?.chat_id ?? detail?.chat_id ?? '';
+        return { chatId, content: parseApiMessage(raw).content };
+      },
+      upsertBase: createFeedbackSurveyBaseUpserter(),
+      // These hooks are intentionally best-effort inside FeedbackSurveyManager:
+      // a master-table problem cannot invalidate a successfully delivered card.
+      onDispatched: noteLogisticsSessionSurveyDispatched,
+      onSettled: noteLogisticsSessionSurveySettled,
+    });
+  } catch (err) {
+    logger.warn(`[feedback-survey] startup failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   writePidFile();
   const memoryDiagnostics = startMemoryDiagnostics();
 
@@ -21476,6 +21617,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             + `${error instanceof Error ? error.message : String(error)}`,
           ),
         });
+      }
+      if (terminal.status === 'completed' && terminal.dispatchAttempt === undefined) {
+        scheduleFeedbackForCompletedTurn(ds, terminal.turnId);
       }
     },
     onDeferredScheduleTurnSettled(ds, context) {
@@ -22487,6 +22631,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
 
     scheduler.stopScheduler();
+    stopFeedbackSurveyManager(cfg.larkAppId);
+    stopLogisticsSessionMasterManager(cfg.larkAppId);
     // NOTE: turn-terminal queue drain + webhook dispatcher stop are deliberately
     // deferred until AFTER workers have stopped producing (see below). Draining
     // here would close queue admission while worker terminal IPC handlers are

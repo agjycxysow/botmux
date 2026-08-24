@@ -202,6 +202,149 @@ describe('buildAskCard', () => {
     });
     expect(text).toContain('超时');
   });
+
+  it('feedback survey follows the headerless reference layout with five equal rating cells', () => {
+    const ask = makePending({
+      purpose: 'feedback_survey',
+      allowCustomReply: false,
+      metadata: {
+        recapPrompt: '帮我检查 <script>alert(1)</script> 的灰度配置',
+        recapAnswer: '已定位 [文档](https://example.com/secret)',
+      },
+      questions: [{
+        prompt: '这次回答对你的帮助有多大？',
+        options: [
+          { key: '1', label: '⭐ 很不满意' },
+          { key: '2', label: '⭐⭐ 不满意' },
+          { key: '3', label: '⭐⭐⭐ 一般' },
+          { key: '4', label: '⭐⭐⭐⭐ 满意' },
+          { key: '5', label: '⭐⭐⭐⭐⭐ 非常满意' },
+        ],
+        multiSelect: false,
+      }],
+    });
+    const card = JSON.parse(buildAskCard(ask));
+    const text = JSON.stringify(card);
+    const elements = card.body.elements as Array<Record<string, any>>;
+    const recap = elements.find((element) =>
+      element.tag === 'interactive_container' && element.background_style === 'grey',
+    );
+    const ratingPrompt = elements.find((element) =>
+      element.tag === 'interactive_container'
+      && JSON.stringify(element).includes('请选择一个最符合你感受的评分'),
+    );
+    const ratingRow = elements.find((element) => element.tag === 'column_set'
+      && Array.isArray(element.columns) && element.columns.length === 5);
+    const subtitle = elements.find((element) =>
+      element.tag === 'div' && element.text?.content === '你的反馈会帮助我们持续改进回答质量',
+    );
+    const footer = elements.at(-1);
+
+    expect(card.schema).toBe('2.0');
+    expect(card.header).toBeUndefined();
+    expect(card.body.padding).toBe('20px');
+    expect(text).toContain('本次回答，帮到你了吗？');
+    expect(text).toContain('Recap · 本轮回顾');
+    expect(text).not.toContain('"tag":"action"');
+    expect(recap).toMatchObject({
+      has_border: true,
+      border_color: 'grey-200',
+      corner_radius: '8px',
+    });
+    expect(ratingPrompt).toMatchObject({
+      padding: '8px 12px',
+      background_style: 'blue-50',
+      corner_radius: '8px',
+    });
+    expect(JSON.stringify(ratingPrompt)).toContain('请选择一个最符合你感受的评分');
+    expect(subtitle).toMatchObject({
+      text: {
+        tag: 'plain_text',
+        text_color: 'grey',
+        text_size: 'normal',
+      },
+    });
+    expect(text).not.toContain('<text_tag');
+    expect(ratingRow).toMatchObject({
+      flex_mode: 'none',
+      horizontal_spacing: 'small',
+    });
+    expect(ratingRow?.columns).toHaveLength(5);
+    for (const [index, column] of ratingRow?.columns.entries() ?? []) {
+      const ratingCell = column.elements[0];
+      expect(ratingCell).toMatchObject({
+        tag: 'interactive_container',
+        background_style: 'grey-50',
+        border_color: 'grey-200',
+        corner_radius: '8px',
+      });
+      expect(ratingCell.elements[0].content).toBe(`**${index + 1} ★**`);
+      expect(ratingCell.behaviors).toEqual([{
+        type: 'callback',
+        value: {
+          action: ASK_SELECT_ACTION,
+          ask_id: 'ask-1',
+          nonce: 'nonce-1',
+          key: String(index + 1),
+        },
+      }]);
+    }
+    expect(text).toContain('很不满意');
+    expect(text).toContain('非常满意');
+    expect(footer).toMatchObject({
+      tag: 'div',
+      text: {
+        tag: 'plain_text',
+        text_color: 'grey',
+        text_align: 'center',
+      },
+    });
+    expect(text).not.toContain('<script>');
+  });
+
+  it('feedback survey terminal card keeps the question recap with a neutral completion panel', () => {
+    const card = JSON.parse(buildAskCard(makePending({
+      purpose: 'feedback_survey',
+      metadata: { recapPrompt: '问题摘要', recapAnswer: '回答摘要' },
+      questions: [{
+        prompt: '评分',
+        options: [{ key: '1', label: '⭐' }, { key: '2', label: '⭐⭐' }],
+        multiSelect: false,
+      }],
+    }), {
+      kind: 'answered',
+      answers: [['5']],
+      by: 'ou_owner',
+      comment: null,
+      timedOut: false,
+    }));
+    const text = JSON.stringify(card);
+    expect(text).toContain('问题摘要');
+    expect(text).not.toContain('回答摘要');
+    expect(text).toContain('★★★★★');
+    expect(text).toContain('感谢你的反馈');
+    expect(text).not.toContain(ASK_SELECT_ACTION);
+    expect(text).not.toContain('"green"');
+    expect(card.header).toBeUndefined();
+  });
+
+  it('feedback survey escapes recap text before rendering it as card markdown', () => {
+    const text = buildAskCard(makePending({
+      purpose: 'feedback_survey',
+      metadata: {
+        recapPrompt: '阈值是 5 < 6 & 7 > 3',
+        recapAnswer: '不渲染 <script>alert(1)</script>',
+      },
+      questions: [{
+        prompt: '评分',
+        options: [{ key: '1', label: '⭐' }, { key: '2', label: '⭐⭐' }],
+        multiSelect: false,
+      }],
+    }));
+
+    expect(text).toContain('阈值是 5 &lt; 6 &amp; 7 &gt; 3');
+    expect(text).not.toContain('<script>');
+  });
 });
 
 describe('handleAskCardAction', () => {
