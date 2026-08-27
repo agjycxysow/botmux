@@ -35,6 +35,7 @@ function usage(message?: string): never {
   botmux logistics sync-catalog [--bot <appId>]
   botmux logistics backfill [--bot <appId>] [--session <id-prefix>] [--since <ISO|YYYY-MM-DD>] [--until <ISO|YYYY-MM-DD>] [--limit N] [--cursor <opaque>] [--harness-root <dir>] [--no-label] [--apply]
   botmux logistics import-legacy [--bot <appId>]
+  botmux logistics import-surveys [--bot <appId>]
 
 backfill defaults to dry-run. It reads bounded BotMux session metadata; --apply fetches
 visible Lark history, runs the configured logistics labeler, and writes SQLite.`);
@@ -439,6 +440,15 @@ function syncCatalog(dataDir: string, args: string[]): void {
   }
 }
 
+function importSurveys(dataDir: string, args: string[]): void {
+  const bot = value(args, '--bot');
+  const unknown = args.filter((arg, index) => arg !== '--bot' && args[index - 1] !== '--bot' && !arg.startsWith('--bot='));
+  if (unknown.length) usage(`Unknown option: ${unknown[0]}`);
+  const store = new LogisticsConversationStore({ dataDir });
+  try { console.log(JSON.stringify(store.importFeedbackSurveyJson(dataDir, bot), null, 2)); }
+  finally { store.close(); }
+}
+
 function importLegacy(dataDir: string, args: string[]): void {
   const bot = value(args, '--bot');
   const unknown = args.filter((arg, index) => arg !== '--bot' && args[index - 1] !== '--bot' && !arg.startsWith('--bot='));
@@ -452,5 +462,6 @@ export async function runLogisticsConversationCommand(sub: string, args: string[
   if (sub === 'sync-catalog') return syncCatalog(dataDir, args);
   if (sub === 'backfill') return backfill(dataDir, args);
   if (sub === 'import-legacy') return importLegacy(dataDir, args);
+  if (sub === 'import-surveys') return importSurveys(dataDir, args);
   usage();
 }

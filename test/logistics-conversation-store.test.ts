@@ -185,3 +185,35 @@ describe('logistics session catalog coverage', () => {
     store.close();
   });
 });
+
+describe('logistics feedback survey import', () => {
+  it('imports all survey rows idempotently without storing raw respondent ids', async () => {
+    const dataDir = await tempDir();
+    const surveyDir = join(dataDir, 'feedback-surveys');
+    await import('node:fs/promises').then(({ mkdir }) => mkdir(surveyDir, { recursive: true }));
+    await writeFile(join(surveyDir, 'cli_logistics.json'), JSON.stringify({
+      version: 1,
+      records: [
+        {
+          surveyId: 'survey-1', larkAppId: 'cli_logistics', sessionId: 'session-1', turnId: 'om_turn',
+          chatId: 'oc_chat', rootMessageId: 'om_root', respondentOpenId: 'ou_private', status: 'answered',
+          scheduledAt: 1_000, dueAt: 2_000, sentAt: 3_000, answeredAt: 4_000, rating: 5, updatedAt: 4_000,
+        },
+        {
+          surveyId: 'survey-2', larkAppId: 'cli_logistics', sessionId: 'session-1', turnId: 'om_turn_2',
+          chatId: 'oc_chat', rootMessageId: 'om_root', respondentOpenId: 'ou_private', status: 'cancelled',
+          scheduledAt: 5_000, dueAt: 6_000, updatedAt: 6_000,
+        },
+      ],
+    }));
+    const store = new LogisticsConversationStore({ dataDir });
+    store.syncSessionCatalog([{
+      larkAppId: 'cli_logistics', sessionId: 'session-1', chatId: 'oc_chat', rootMessageId: 'om_root',
+      scope: 'thread', sessionStatus: 'closed', createdAt: 1_000,
+    }]);
+    expect(store.importFeedbackSurveyJson(dataDir, 'cli_logistics')).toEqual({ files: 1, records: 2 });
+    expect(store.importFeedbackSurveyJson(dataDir, 'cli_logistics')).toEqual({ files: 1, records: 2 });
+    expect(store.summary()).toMatchObject({ surveyRecords: 2, answeredSurveys: 1 });
+    store.close();
+  });
+});

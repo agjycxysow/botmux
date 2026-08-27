@@ -65,6 +65,7 @@ describe('standalone logistics analytics server', () => {
       expect(overview.status).toBe(200);
       await expect(overview.json()).resolves.toMatchObject({
         totalSessions: 2, conversations: 1, labeled: 1, pendingBackfill: 1,
+        surveyRecords: 0, answeredSurveys: 0,
         analysisCoverage: 0.5, labelCoverage: 0.5, resolved: 1,
       });
       const pending = await fetch(`${base}/api/sessions?dataStatus=pending`, { headers });

@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 
+import type { FeedbackSurveyRecord } from './feedback-survey.js';
 import type {
   LogisticsEvidenceAnchor,
   LogisticsSessionMasterRecord,
@@ -11,7 +12,7 @@ import type {
 
 const require = createRequire(import.meta.url);
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const DEFAULT_FILE = 'botmux-conversations.sqlite';
 
 export interface LogisticsConversationStoreOptions {
@@ -67,6 +68,8 @@ export interface LogisticsConversationSummary {
   failedBackfill: number;
   analysisCoverage: number;
   labelCoverage: number;
+  surveyRecords: number;
+  answeredSurveys: number;
   messages: number;
   resolved: number;
   inProgress: number;
@@ -322,6 +325,24 @@ export class LogisticsConversationStore {
         CREATE INDEX IF NOT EXISTS session_catalog_updated ON session_catalog(updated_at DESC,session_key DESC);
         CREATE INDEX IF NOT EXISTS session_catalog_bot_updated ON session_catalog(lark_app_id,updated_at DESC,session_key DESC);
         CREATE INDEX IF NOT EXISTS session_catalog_backfill ON session_catalog(backfill_status,updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS conversation_surveys (
+          survey_id TEXT PRIMARY KEY,
+          lark_app_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          turn_id TEXT NOT NULL,
+          respondent_subject_hash TEXT,
+          status TEXT NOT NULL,
+          rating INTEGER,
+          scheduled_at INTEGER NOT NULL,
+          due_at INTEGER NOT NULL,
+          sent_at INTEGER,
+          answered_at INTEGER,
+          failure_reason TEXT,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS conversation_surveys_session ON conversation_surveys(lark_app_id,session_id,updated_at DESC);
+        CREATE INDEX IF NOT EXISTS conversation_surveys_status ON conversation_surveys(status,updated_at DESC);
 
         CREATE TABLE IF NOT EXISTS conversations (
           master_key TEXT PRIMARY KEY,
@@ -594,6 +615,52 @@ export class LogisticsConversationStore {
     return { files, records };
   }
 
+  importFeedbackSurveyJson(dataDir: string, larkAppId?: string): { files: number; records: number } {
+    const dir = join(dataDir, 'feedback-surveys');
+    if (!existsSync(dir)) return { files: 0, records: 0 };
+    let files = 0;
+    let records = 0;
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      for (const name of readdirSync(dir)) {
+        if (!name.endsWith('.json')) continue;
+        if (larkAppId && name !== `${larkAppId.replace(/[^a-zA-Z0-9._-]/g, '_')}.json`) continue;
+        try {
+          const payload = JSON.parse(readFileSync(join(dir, name), 'utf8')) as { records?: FeedbackSurveyRecord[] };
+          if (!Array.isArray(payload.records)) continue;
+          files += 1;
+          for (const record of payload.records) {
+            if (!record?.surveyId || !record?.larkAppId || !record?.sessionId || !record?.turnId) continue;
+            const respondentHash = record.respondentOpenId
+              ? createHash('sha256').update(record.respondentOpenId).digest('hex') : null;
+            this.db.prepare(`
+              INSERT INTO conversation_surveys (
+                survey_id,lark_app_id,session_id,turn_id,respondent_subject_hash,status,rating,
+                scheduled_at,due_at,sent_at,answered_at,failure_reason,updated_at
+              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(survey_id) DO UPDATE SET status=excluded.status,rating=excluded.rating,
+                sent_at=excluded.sent_at,answered_at=excluded.answered_at,
+                failure_reason=excluded.failure_reason,updated_at=excluded.updated_at
+            `).run(
+              record.surveyId, record.larkAppId, record.sessionId, record.turnId,
+              respondentHash, record.status, record.rating ?? null, record.scheduledAt,
+              record.dueAt, record.sentAt ?? null, record.answeredAt ?? null,
+              safeMetadata(record.failureReason, 500), record.updatedAt,
+            );
+            records += 1;
+          }
+        } catch {
+          // A corrupt survey file is isolated from other bot stores.
+        }
+      }
+      this.db.exec('COMMIT;');
+    } catch (error) {
+      this.db.exec('ROLLBACK;');
+      throw error;
+    }
+    return { files, records };
+  }
+
   summary(filters: LogisticsConversationFilters = {}): LogisticsConversationSummary {
     const w = where(filters);
     const row = this.db.prepare(`
@@ -614,6 +681,13 @@ export class LogisticsConversationStore {
       LEFT JOIN conversations c ON c.lark_app_id=sc.lark_app_id AND c.session_id=sc.session_id
       ${w.sql}
     `).get(...w.params) as any;
+    const survey = this.db.prepare(`
+      SELECT COUNT(*) survey_records,COALESCE(SUM(s.status='answered'),0) answered_surveys
+      FROM conversation_surveys s
+      LEFT JOIN session_catalog sc ON s.lark_app_id=sc.lark_app_id AND s.session_id=sc.session_id
+      LEFT JOIN conversations c ON c.lark_app_id=sc.lark_app_id AND c.session_id=sc.session_id
+      ${w.sql}
+    `).get(...w.params) as any;
     const totalSessions = Number(row.total_sessions ?? 0);
     const conversations = Number(row.conversations ?? 0);
     const labeled = Number(row.labeled ?? 0);
@@ -627,6 +701,8 @@ export class LogisticsConversationStore {
       failedBackfill: Number(row.failed_backfill ?? 0),
       analysisCoverage: totalSessions ? conversations / totalSessions : 0,
       labelCoverage: totalSessions ? labeled / totalSessions : 0,
+      surveyRecords: Number(survey.survey_records ?? 0),
+      answeredSurveys: Number(survey.answered_surveys ?? 0),
       messages: Number(row.messages ?? 0),
       resolved,
       inProgress: Number(row.in_progress ?? 0),
