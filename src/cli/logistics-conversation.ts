@@ -93,10 +93,17 @@ function sessionTime(session: Session): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function latestSendMarker(dataDir: string, sessionId: string): { messageId?: string; sentAtMs?: number } {
+interface LogisticsSendMarker {
+  messageId?: string;
+  sentAtMs?: number;
+  previewText?: string;
+  contentLength?: number;
+}
+
+function latestSendMarker(dataDir: string, sessionId: string): LogisticsSendMarker {
   const path = join(dataDir, 'turn-sends', `${sessionId}.jsonl`);
   if (!existsSync(path)) return {};
-  let latest: { messageId?: string; sentAtMs?: number } = {};
+  let latest: LogisticsSendMarker = {};
   try {
     for (const line of readFileSync(path, 'utf8').split('\n')) {
       if (!line.trim()) continue;
@@ -104,6 +111,8 @@ function latestSendMarker(dataDir: string, sessionId: string): { messageId?: str
         const parsed = JSON.parse(line) as Record<string, unknown>;
         if (typeof parsed.messageId === 'string') latest.messageId = parsed.messageId;
         if (typeof parsed.sentAtMs === 'number') latest.sentAtMs = parsed.sentAtMs;
+        if (typeof parsed.previewText === 'string') latest.previewText = parsed.previewText;
+        if (typeof parsed.contentLength === 'number') latest.contentLength = parsed.contentLength;
       } catch { /* malformed historical row */ }
     }
   } catch { /* best effort */ }
@@ -207,6 +216,27 @@ export function logisticsSessionCatalogInput(session: Session): LogisticsSession
   };
 }
 
+
+export function mergeLogisticsAnswerPreview(
+  messages: ReadonlyArray<{ messageId: string; senderType?: string; content: string; createTime?: string }>,
+  answerMessageId: string | undefined,
+  marker: LogisticsSendMarker,
+): Array<{ messageId: string; senderType?: string; content: string; createTime?: string }> {
+  const preview = marker.previewText?.trim();
+  if (!answerMessageId || marker.messageId !== answerMessageId || !preview || preview === 'BOTMUX_NOTHING_TO_SEND') {
+    return [...messages];
+  }
+  const index = messages.findIndex(message => message.messageId === answerMessageId);
+  if (index < 0) return [...messages];
+  const current = messages[index]!.content.trim();
+  const nonTerminal = /\[卡片:|工作中|等待输入|显示输出|打开(?:可操作 )?Web 终端|Ask Codex|BOTMUX_NOTHING_TO_SEND/i.test(current);
+  const previewIsRicher = preview.length >= Math.max(20, current.length * 1.2)
+    || (marker.contentLength !== undefined && marker.contentLength > current.length);
+  if (!nonTerminal && !previewIsRicher) return [...messages];
+  return messages.map((message, messageIndex) => messageIndex === index
+    ? { ...message, senderType: 'app', content: preview }
+    : { ...message });
+}
 
 export function inferLogisticsBackfillBoundaries(
   messages: ReadonlyArray<{ messageId: string; senderType?: string; content: string }>,
@@ -339,13 +369,14 @@ async function backfill(dataDir: string, args: string[]): Promise<void> {
           store.markSessionBackfill(bot.larkAppId, session.sessionId, 'missing_answer');
           continue;
         }
+        const hydratedMessages = mergeLogisticsAnswerPreview(parsedMessages, boundary.answerMessageId, marker);
         const snapshot = buildLogisticsSessionSnapshot({
           turnId: boundary.turnId,
           answerMessageId: boundary.answerMessageId,
           rootMessageId: session.scope === 'chat' ? null : session.rootMessageId,
           sessionStartedAt: session.createdAt,
           maxTranscriptChars: bot.logisticsSessionMaster?.maxTranscriptChars,
-          messages: parsedMessages,
+          messages: hydratedMessages,
         });
         const now = Date.now();
         const masterKey = stableLogisticsSessionMasterKey(bot.larkAppId, session.sessionId, boundary.turnId, session.chatId);

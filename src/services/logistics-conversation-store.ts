@@ -681,8 +681,8 @@ export class LogisticsConversationStore {
     const row = this.db.prepare(`
       SELECT COUNT(*) total_sessions,
         COALESCE(SUM(c.master_key IS NOT NULL),0) conversations,
-        COALESCE(SUM(sc.backfill_status IN ('snapshot_ready','labeled','label_failed')),0) snapshotted,
-        COALESCE(SUM(sc.backfill_status='labeled'),0) labeled,
+        COALESCE(SUM(c.master_key IS NOT NULL AND EXISTS(SELECT 1 FROM conversation_snapshots cs WHERE cs.master_key=c.master_key)),0) snapshotted,
+        COALESCE(SUM(c.master_key IS NOT NULL AND EXISTS(SELECT 1 FROM conversation_labels cl WHERE cl.master_key=c.master_key)),0) labeled,
         COALESCE(SUM(sc.backfill_status IN ('pending','processing','missing_turn','missing_answer')),0) pending_backfill,
         COALESCE(SUM(sc.backfill_status IN ('history_failed','label_failed')),0) failed_backfill,
         COALESCE(SUM(c.message_count),0) messages,
@@ -697,7 +697,7 @@ export class LogisticsConversationStore {
       ${w.sql}
     `).get(...w.params) as any;
     const survey = this.db.prepare(`
-      SELECT COUNT(*) survey_records,COALESCE(SUM(s.status='answered'),0) answered_surveys
+      SELECT COUNT(*) survey_records,COALESCE(SUM(s.status='answered'),0) answered_surveys,AVG(s.rating) average_rating
       FROM conversation_surveys s
       LEFT JOIN session_catalog sc ON s.lark_app_id=sc.lark_app_id AND s.session_id=sc.session_id
       LEFT JOIN conversations c ON c.lark_app_id=sc.lark_app_id AND c.session_id=sc.session_id
@@ -724,8 +724,8 @@ export class LogisticsConversationStore {
       unknown: Number(row.unknown_count ?? 0),
       needsReview: Number(row.needs_review ?? 0),
       rated: Number(row.rated ?? 0),
-      averageRating: row.average_rating === null || row.average_rating === undefined
-        ? null : Math.round(Number(row.average_rating) * 100) / 100,
+      averageRating: survey.average_rating === null || survey.average_rating === undefined
+        ? null : Math.round(Number(survey.average_rating) * 100) / 100,
       resolutionRate: conversations ? resolved / conversations : 0,
     };
   }

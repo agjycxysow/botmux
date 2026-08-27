@@ -86,3 +86,27 @@ describe('logistics backfill cursor pagination', () => {
     });
   });
 });
+
+describe('logistics answer preview hydration', () => {
+  it('replaces a non-terminal card placeholder with the delivered final text', async () => {
+    const { mergeLogisticsAnswerPreview } = await import('../src/cli/logistics-conversation.js');
+    expect(mergeLogisticsAnswerPreview([
+      { messageId: 'om_turn', senderType: 'user', content: '帮我定位问题' },
+      { messageId: 'om_answer', senderType: 'app', content: '[卡片: Codex 工作中]' },
+    ], 'om_answer', {
+      messageId: 'om_answer', contentLength: 48,
+      previewText: '结论：问题已经定位，并给出了可核验的修复路径。',
+    })).toEqual([
+      { messageId: 'om_turn', senderType: 'user', content: '帮我定位问题' },
+      { messageId: 'om_answer', senderType: 'app', content: '结论：问题已经定位，并给出了可核验的修复路径。' },
+    ]);
+  });
+
+  it('does not replace an existing substantive answer with a shorter preview', async () => {
+    const { mergeLogisticsAnswerPreview } = await import('../src/cli/logistics-conversation.js');
+    const messages = [{ messageId: 'om_answer', senderType: 'app', content: '这是已经完整投递且可核验的最终回答内容。' }];
+    expect(mergeLogisticsAnswerPreview(messages, 'om_answer', {
+      messageId: 'om_answer', previewText: '简短摘要', contentLength: 4,
+    })).toEqual(messages);
+  });
+});

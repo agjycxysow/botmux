@@ -100,7 +100,7 @@ describe('logistics conversation SQLite store', () => {
       unknown: 1,
       needsReview: 1,
       rated: 1,
-      averageRating: 5,
+      averageRating: null,
       resolutionRate: 0.5,
     });
     expect(store.trend()).toEqual([
