@@ -2,18 +2,21 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { loadBotConfigs, registerBot, type BotConfig } from '../bot-registry.js';
-import { listChatMessages, listThreadMessages } from '../im/lark/client.js';
+import { listChatMessagesUntil, listThreadMessages } from '../im/lark/client.js';
 import { parseApiMessage } from '../im/lark/message-parser.js';
-import { buildLogisticsSessionSnapshot } from '../services/logistics-session-capture.js';
+import {
+  buildLogisticsSessionSnapshot,
+  sanitizeLogisticsMessageText,
+} from '../services/logistics-session-capture.js';
 import {
   LogisticsConversationStore,
+  type LogisticsCapturedMessageInput,
   type LogisticsSessionCatalogInput,
 } from '../services/logistics-conversation-store.js';
 import {
   stableLogisticsSessionMasterKey,
   type LogisticsSessionMasterRecord,
 } from '../services/logistics-session-master.js';
-import { createLogisticsSessionModelTaskRunner } from '../services/logistics-session-model-task.js';
 import { loadAllSessionsSnapshot } from '../services/session-store.js';
 import type { Session } from '../types.js';
 
@@ -24,8 +27,6 @@ interface BackfillOptions {
   since?: number;
   until?: number;
   limit: number;
-  harnessRoot?: string;
-  noLabel: boolean;
   cursor?: string;
 }
 
@@ -33,12 +34,13 @@ function usage(message?: string): never {
   if (message) console.error(message);
   console.error(`Usage:
   botmux logistics sync-catalog [--bot <appId>]
-  botmux logistics backfill [--bot <appId>] [--session <id-prefix>] [--since <ISO|YYYY-MM-DD>] [--until <ISO|YYYY-MM-DD>] [--limit N] [--cursor <opaque>] [--harness-root <dir>] [--no-label] [--apply]
+  botmux logistics backfill [--bot <appId>] [--session <id-prefix>] [--since <ISO|YYYY-MM-DD>] [--until <ISO|YYYY-MM-DD>] [--limit N] [--cursor <opaque>] [--apply]
   botmux logistics import-legacy [--bot <appId>]
   botmux logistics import-surveys [--bot <appId>]
 
 backfill defaults to dry-run. It reads bounded BotMux session metadata; --apply fetches
-visible Lark history, runs the configured logistics labeler, and writes SQLite.`);
+visible Lark history and writes sanitized message facts plus bounded snapshots to SQLite.
+It never runs semantic labeling.`);
   process.exit(2);
 }
 
@@ -63,10 +65,10 @@ function dateArg(raw: string | undefined, end: boolean): number | undefined {
 }
 
 function parseBackfill(args: string[]): BackfillOptions {
-  const knownWithValue = new Set(['--bot', '--session', '--since', '--until', '--limit', '--cursor', '--harness-root']);
+  const knownWithValue = new Set(['--bot', '--session', '--since', '--until', '--limit', '--cursor']);
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i]!;
-    if (arg === '--apply' || arg === '--no-label') continue;
+    if (arg === '--apply') continue;
     const flag = arg.includes('=') ? arg.slice(0, arg.indexOf('=')) : arg;
     if (!knownWithValue.has(flag)) usage(`Unknown option: ${arg}`);
     if (!arg.includes('=')) i += 1;
@@ -81,8 +83,6 @@ function parseBackfill(args: string[]): BackfillOptions {
     since: dateArg(value(args, '--since'), false),
     until: dateArg(value(args, '--until'), true),
     limit,
-    harnessRoot: value(args, '--harness-root'),
-    noLabel: args.includes('--no-label'),
     cursor: value(args, '--cursor'),
   };
 }
@@ -109,10 +109,12 @@ function latestSendMarker(dataDir: string, sessionId: string): LogisticsSendMark
       if (!line.trim()) continue;
       try {
         const parsed = JSON.parse(line) as Record<string, unknown>;
-        if (typeof parsed.messageId === 'string') latest.messageId = parsed.messageId;
-        if (typeof parsed.sentAtMs === 'number') latest.sentAtMs = parsed.sentAtMs;
-        if (typeof parsed.previewText === 'string') latest.previewText = parsed.previewText;
-        if (typeof parsed.contentLength === 'number') latest.contentLength = parsed.contentLength;
+        latest = {
+          ...(typeof parsed.messageId === 'string' ? { messageId: parsed.messageId } : {}),
+          ...(typeof parsed.sentAtMs === 'number' ? { sentAtMs: parsed.sentAtMs } : {}),
+          ...(typeof parsed.previewText === 'string' ? { previewText: parsed.previewText } : {}),
+          ...(typeof parsed.contentLength === 'number' ? { contentLength: parsed.contentLength } : {}),
+        };
       } catch { /* malformed historical row */ }
     }
   } catch { /* best effort */ }
@@ -227,7 +229,21 @@ export function mergeLogisticsAnswerPreview(
     return [...messages];
   }
   const index = messages.findIndex(message => message.messageId === answerMessageId);
-  if (index < 0) return [...messages];
+  if (index < 0) {
+    return [
+      ...messages,
+      {
+        messageId: answerMessageId,
+        senderType: 'app',
+        content: preview,
+        ...(marker.sentAtMs ? { createTime: String(marker.sentAtMs) } : {}),
+      },
+    ].sort((left, right) => {
+      const leftAt = historyMessageTime(left) ?? Number.MAX_SAFE_INTEGER;
+      const rightAt = historyMessageTime(right) ?? Number.MAX_SAFE_INTEGER;
+      return leftAt - rightAt;
+    });
+  }
   const current = messages[index]!.content.trim();
   const nonTerminal = /\[卡片:|工作中|等待输入|显示输出|打开(?:可操作 )?Web 终端|Ask Codex|BOTMUX_NOTHING_TO_SEND/i.test(current);
   const previewIsRicher = preview.length >= Math.max(20, current.length * 1.2)
@@ -236,6 +252,128 @@ export function mergeLogisticsAnswerPreview(
   return messages.map((message, messageIndex) => messageIndex === index
     ? { ...message, senderType: 'app', content: preview }
     : { ...message });
+}
+
+type LogisticsHistoryMessage = {
+  messageId: string;
+  senderType?: string;
+  content: string;
+  createTime?: string;
+};
+
+const CHAT_BACKFILL_PADDING_MS = 120_000;
+const CHAT_BACKFILL_MAX_MESSAGES = 5_000;
+
+function historyMessageTime(message: { createTime?: string }): number | undefined {
+  const parsed = Number(message.createTime);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+export function logisticsBackfillErrorReason(error: unknown): string {
+  const candidate = error as {
+    message?: unknown;
+    response?: { data?: { code?: unknown; msg?: unknown } };
+  };
+  const code = candidate?.response?.data?.code;
+  const message = candidate?.response?.data?.msg;
+  if ((typeof code === 'number' || typeof code === 'string') && typeof message === 'string') {
+    return `lark_${code}:${message}`.slice(0, 300);
+  }
+  return (error instanceof Error ? error.message : String(error)).slice(0, 300);
+}
+
+async function fetchLogisticsSessionHistory(
+  session: Session,
+  larkAppId: string,
+): Promise<{ messages: LogisticsHistoryMessage[]; complete: boolean }> {
+  if (session.scope !== 'chat') {
+    const raw = await listThreadMessages(larkAppId, session.chatId, session.rootMessageId, 0);
+    return {
+      messages: raw.map(item => {
+        const parsed = parseApiMessage(item);
+        return {
+          messageId: parsed.messageId,
+          senderType: parsed.senderType,
+          content: parsed.content,
+          createTime: parsed.createTime,
+        };
+      }),
+      complete: true,
+    };
+  }
+
+  const sessionStartedAt = Date.parse(session.createdAt);
+  if (!Number.isFinite(sessionStartedAt)) throw new Error('invalid_session_created_at');
+  let stoppedAtLimit = false;
+  const raw = await listChatMessagesUntil(larkAppId, session.chatId, {
+    stopAfter: (item, seenCount) => {
+      const parsed = parseApiMessage(item);
+      const occurredAt = historyMessageTime(parsed);
+      if (occurredAt !== undefined && occurredAt < sessionStartedAt - CHAT_BACKFILL_PADDING_MS) {
+        return true;
+      }
+      if (seenCount >= CHAT_BACKFILL_MAX_MESSAGES) {
+        stoppedAtLimit = true;
+        return true;
+      }
+      return false;
+    },
+  });
+  const sessionEndedAt = sessionTime(session);
+  const messages = raw.map(item => {
+    const parsed = parseApiMessage(item);
+    return {
+      messageId: parsed.messageId,
+      senderType: parsed.senderType,
+      content: parsed.content,
+      createTime: parsed.createTime,
+    };
+  }).filter(message => {
+    const occurredAt = historyMessageTime(message);
+    return occurredAt === undefined
+      || (occurredAt >= sessionStartedAt - CHAT_BACKFILL_PADDING_MS
+        && occurredAt <= sessionEndedAt + CHAT_BACKFILL_PADDING_MS);
+  });
+  return { messages, complete: !stoppedAtLimit };
+}
+
+export function buildLogisticsCapturedMessages(input: {
+  larkAppId: string;
+  sessionId: string;
+  messages: ReadonlyArray<LogisticsHistoryMessage>;
+  finalAnswerMessageId?: string;
+  markerHydratedMessageId?: string;
+}): LogisticsCapturedMessageInput[] {
+  let latestUserMessageId: string | undefined;
+  return input.messages.flatMap(message => {
+    const role = message.senderType === 'user'
+      ? 'user'
+      : message.senderType === 'app'
+        ? 'assistant'
+        : undefined;
+    const content = sanitizeLogisticsMessageText(message.content);
+    if (!role || !content) return [];
+    if (role === 'user') latestUserMessageId = message.messageId;
+    const occurredAt = historyMessageTime(message);
+    return [{
+      larkAppId: input.larkAppId,
+      sessionId: input.sessionId,
+      role,
+      content,
+      ...(message.messageId ? { platformMessageId: message.messageId } : {}),
+      ...(occurredAt !== undefined ? { occurredAt } : {}),
+      ...(role === 'user' && message.messageId ? { turnId: message.messageId } : {}),
+      ...(role === 'assistant' && latestUserMessageId
+        ? { turnId: latestUserMessageId, triggerMessageId: latestUserMessageId }
+        : {}),
+      ...(message.messageId === input.finalAnswerMessageId
+        ? { responseKind: 'final' as const }
+        : {}),
+      source: message.messageId === input.markerHydratedMessageId
+        ? 'botmux_send_marker' as const
+        : 'lark_history' as const,
+    }];
+  });
 }
 
 export function inferLogisticsBackfillBoundaries(
@@ -250,7 +388,9 @@ export function inferLogisticsBackfillBoundaries(
       const message = messages[index]!;
       if (message.senderType !== 'app') continue;
       if (!message.content.trim()) continue;
-      if (/这次回答对你的帮助有多大|很不满意|非常满意/.test(message.content)) continue;
+      if (/这次回答对你的帮助有多大|很不满意|非常满意|\[卡片:|工作中|等待输入|显示输出|打开(?:可操作 )?Web 终端|Ask Codex|BOTMUX_NOTHING_TO_SEND/i.test(message.content)) {
+        continue;
+      }
       answerIndex = index;
       break;
     }
@@ -298,7 +438,8 @@ async function backfill(dataDir: string, args: string[]): Promise<void> {
     console.log(JSON.stringify({
       mode: 'apply', candidates: 0, totalCandidates: page.totalCandidates,
       hasMore: page.hasMore, nextCursor: page.nextCursor ?? null,
-      imported: 0, skipped: {}, failed: 0, failures: [],
+      captured: 0, messages: { total: 0, inserted: 0, updated: 0 },
+      statuses: {}, failed: 0, failures: [],
     }, null, 2));
     return;
   }
@@ -311,65 +452,76 @@ async function backfill(dataDir: string, args: string[]): Promise<void> {
     .filter(session => session.larkAppId === bot.larkAppId)
     .map(logisticsSessionCatalogInput)
     .filter((row): row is LogisticsSessionCatalogInput => !!row));
-  const runner = options.noLabel ? undefined : createLogisticsSessionModelTaskRunner({
-    cliId: bot.cliId,
-    cliPathOverride: bot.cliPathOverride,
-    wrapperCli: bot.wrapperCli,
-    model: bot.logisticsSessionMaster?.modelTask?.model ?? bot.model,
-    env: bot.env,
-    timeoutMs: bot.logisticsSessionMaster?.modelTask?.timeoutMs,
-    harnessRoot: options.harnessRoot ?? bot.logisticsSessionMaster?.harness?.rootDir,
-  });
   const result = {
     mode: 'apply',
     candidates: sessions.length,
     totalCandidates: page.totalCandidates,
     hasMore: page.hasMore,
     nextCursor: page.nextCursor ?? null,
-    imported: 0,
-    skipped: {} as Record<string, number>,
+    captured: 0,
+    messages: { total: 0, inserted: 0, updated: 0 },
+    statuses: {} as Record<string, number>,
     failed: 0,
     failures: [] as Array<{ session: string; reason: string }>,
   };
-  const skip = (reason: string) => { result.skipped[reason] = (result.skipped[reason] ?? 0) + 1; };
+  const countStatus = (status: string) => {
+    result.statuses[status] = (result.statuses[status] ?? 0) + 1;
+  };
   try {
     for (const session of sessions) {
       if (session.larkAppId !== bot.larkAppId) {
-        skip('different_bot');
+        countStatus('skipped');
         if (session.larkAppId) store.markSessionBackfill(session.larkAppId, session.sessionId, 'skipped', 'different_bot');
         continue;
       }
       const marker = latestSendMarker(dataDir, session.sessionId);
       store.markSessionBackfill(bot.larkAppId, session.sessionId, 'processing');
       try {
-        const raw = session.scope === 'chat'
-          ? await listChatMessages(bot.larkAppId, session.chatId, 200)
-          : await listThreadMessages(bot.larkAppId, session.chatId, session.rootMessageId, 0);
-        const parsedMessages = raw.map(item => {
-          const parsed = parseApiMessage(item);
-          return {
-            messageId: parsed.messageId,
-            senderType: parsed.senderType,
-            content: parsed.content,
-            createTime: parsed.createTime,
-          };
-        });
+        const history = await fetchLogisticsSessionHistory(session, bot.larkAppId);
+        const hydratedMessages = mergeLogisticsAnswerPreview(
+          history.messages,
+          marker.messageId,
+          marker,
+        );
         const boundary = inferLogisticsBackfillBoundaries(
-          parsedMessages,
+          hydratedMessages,
           session.quoteTargetId ?? (session.rootMessageId.startsWith('om_') ? session.rootMessageId : undefined),
           marker.messageId,
         );
+        const capturedMessages = buildLogisticsCapturedMessages({
+          larkAppId: bot.larkAppId,
+          sessionId: session.sessionId,
+          messages: hydratedMessages,
+          finalAnswerMessageId: boundary.answerMessageId,
+          ...(marker.messageId && marker.previewText?.trim()
+            ? { markerHydratedMessageId: marker.messageId }
+            : {}),
+        });
+        const write = store.upsertCapturedMessages(capturedMessages);
+        result.messages.total += write.total;
+        result.messages.inserted += write.inserted;
+        result.messages.updated += write.updated;
+        if (!history.complete) {
+          const reason = `chat_history_limit:${CHAT_BACKFILL_MAX_MESSAGES}`;
+          store.markSessionBackfill(bot.larkAppId, session.sessionId, 'history_failed', reason);
+          countStatus('history_failed');
+          result.failed += 1;
+          if (result.failures.length < 20) result.failures.push({
+            session: session.sessionId.slice(0, 12),
+            reason,
+          });
+          continue;
+        }
         if (!boundary.turnId) {
-          skip('missing_turn');
           store.markSessionBackfill(bot.larkAppId, session.sessionId, 'missing_turn');
+          countStatus('missing_turn');
           continue;
         }
         if (!boundary.answerMessageId) {
-          skip('missing_answer');
           store.markSessionBackfill(bot.larkAppId, session.sessionId, 'missing_answer');
+          countStatus('missing_answer');
           continue;
         }
-        const hydratedMessages = mergeLogisticsAnswerPreview(parsedMessages, boundary.answerMessageId, marker);
         const snapshot = buildLogisticsSessionSnapshot({
           turnId: boundary.turnId,
           answerMessageId: boundary.answerMessageId,
@@ -400,47 +552,22 @@ async function backfill(dataDir: string, args: string[]): Promise<void> {
           transcriptHash: snapshot.transcriptHash,
           captureState: snapshot.captureState,
           messages: snapshot.messages,
-          taggingState: runner ? 'tagging' : 'needs_review',
-          needsReview: snapshot.captureState === 'partial' || !runner,
-          reviewReason: snapshot.reviewReason ?? (!runner ? '历史回溯跳过自动打标' : undefined),
+          taggingState: 'needs_review',
+          needsReview: snapshot.captureState === 'partial',
+          reviewReason: snapshot.reviewReason,
           manualReviewStatus: 'pending',
-          modelAttempts: runner ? 1 : 0,
+          modelAttempts: 0,
           baseSyncAttempts: 0,
           createdAt: Date.parse(session.createdAt) || now,
           updatedAt: marker.sentAtMs ?? (sessionTime(session) || now),
         };
-        store.markSessionBackfill(bot.larkAppId, session.sessionId, 'snapshot_ready');
-        if (runner) {
-          try {
-            const tagging = await runner({ record });
-            Object.assign(record, {
-              businessCategory: tagging.businessCategory,
-              problemType: tagging.problemType,
-              resolutionStatus: tagging.resolutionStatus,
-              overallConfidence: tagging.overallConfidence,
-              needsReview: record.needsReview || tagging.needsReview,
-              reviewReason: [record.reviewReason, tagging.reviewReason].filter(Boolean).join('；') || undefined,
-              harnessRevision: tagging.harnessRevision,
-              businessReasonCode: tagging.businessReasonCode,
-              problemReasonCode: tagging.problemReasonCode,
-              resolutionReasonCode: tagging.resolutionReasonCode,
-              evidenceAnchors: tagging.evidenceAnchors,
-              taggingState: tagging.needsReview ? 'needs_review' : 'tagged',
-            });
-          } catch (error) {
-            const reason = error instanceof Error ? error.message : String(error);
-            record.taggingState = 'needs_review';
-            record.needsReview = true;
-            record.modelError = reason.slice(0, 500);
-            record.reviewReason = [record.reviewReason, `历史打标失败：${reason.slice(0, 200)}`]
-              .filter(Boolean).join('；');
-          }
-        }
-        store.upsert(record);
-        result.imported += 1;
+        store.upsertCapture(record, capturedMessages.length);
+        result.captured += 1;
+        countStatus('captured');
       } catch (error) {
-        const reason = error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300);
+        const reason = logisticsBackfillErrorReason(error);
         store.markSessionBackfill(bot.larkAppId, session.sessionId, 'history_failed', reason);
+        countStatus('history_failed');
         result.failed += 1;
         if (result.failures.length < 20) result.failures.push({
           session: session.sessionId.slice(0, 12),

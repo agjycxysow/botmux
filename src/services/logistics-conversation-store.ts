@@ -12,7 +12,7 @@ import type {
 
 const require = createRequire(import.meta.url);
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const DEFAULT_FILE = 'botmux-conversations.sqlite';
 
 export interface LogisticsConversationStoreOptions {
@@ -24,13 +24,30 @@ export interface LogisticsConversationStoreOptions {
 export type LogisticsBackfillStatus =
   | 'pending'
   | 'processing'
+  | 'captured'
   | 'missing_turn'
   | 'missing_answer'
   | 'history_failed'
-  | 'snapshot_ready'
-  | 'labeled'
-  | 'label_failed'
   | 'skipped';
+
+export interface LogisticsCapturedMessageInput {
+  larkAppId: string;
+  sessionId: string;
+  role: 'user' | 'assistant';
+  content: string;
+  platformMessageId?: string;
+  occurredAt?: number;
+  turnId?: string;
+  triggerMessageId?: string;
+  responseKind?: 'final';
+  source: 'lark_history' | 'botmux_send_marker' | 'snapshot_projection' | 'legacy_snapshot';
+}
+
+export interface LogisticsCapturedMessageWriteResult {
+  total: number;
+  inserted: number;
+  updated: number;
+}
 
 export interface LogisticsSessionCatalogInput {
   larkAppId: string;
@@ -197,6 +214,29 @@ function sessionPublicId(larkAppId: string, sessionId: string): string {
   return `sess_${createHash('sha256').update(`${larkAppId}:${sessionId}`).digest('hex').slice(0, 32)}`;
 }
 
+function capturedMessageId(message: LogisticsCapturedMessageInput): string {
+  const stable = message.platformMessageId
+    ? `${message.larkAppId}:${message.sessionId}:${message.platformMessageId}`
+    : JSON.stringify({
+        app: message.larkAppId,
+        session: message.sessionId,
+        role: message.role,
+        occurredAt: message.occurredAt ?? null,
+        content: message.content,
+      });
+  return `msg_${createHash('sha256').update(stable).digest('hex')}`;
+}
+
+function capturedMessageContentHash(content: string): string {
+  return createHash('sha256').update(content).digest('hex');
+}
+
+function capturedMessageSourceRank(source: LogisticsCapturedMessageInput['source']): number {
+  if (source === 'botmux_send_marker') return 3;
+  if (source === 'lark_history') return 2;
+  return 1;
+}
+
 
 export class LogisticsConversationStore {
   readonly path: string;
@@ -271,6 +311,72 @@ export class LogisticsConversationStore {
     conversationId?: string,
   ): void {
     this.markSessionBackfillInside(larkAppId, sessionId, status, error, conversationId);
+  }
+
+  upsertCapturedMessages(
+    messages: LogisticsCapturedMessageInput[],
+    capturedAt = Date.now(),
+  ): LogisticsCapturedMessageWriteResult {
+    const result: LogisticsCapturedMessageWriteResult = {
+      total: messages.length,
+      inserted: 0,
+      updated: 0,
+    };
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      for (const message of messages) {
+        const outcome = this.upsertCapturedMessageInside(message, capturedAt);
+        result[outcome] += 1;
+      }
+      this.db.exec('COMMIT;');
+      return result;
+    } catch (error) {
+      this.db.exec('ROLLBACK;');
+      throw error;
+    }
+  }
+
+  private upsertCapturedMessageInside(
+    message: LogisticsCapturedMessageInput,
+    capturedAt: number,
+  ): 'inserted' | 'updated' {
+    const sessionKey = `${message.larkAppId}:${message.sessionId}`;
+    const messageId = capturedMessageId(message);
+    const contentHash = capturedMessageContentHash(message.content);
+    const existing = this.db.prepare(`
+      SELECT content_hash,source FROM conversation_messages WHERE message_id=?
+    `).get(messageId) as { content_hash: string; source: LogisticsCapturedMessageInput['source'] } | undefined;
+    const preserveHigherFidelity = existing
+      && capturedMessageSourceRank(existing.source) > capturedMessageSourceRank(message.source);
+    if (!preserveHigherFidelity) {
+      this.db.prepare(`
+        INSERT INTO conversation_messages (
+          message_id,session_key,platform_message_id,role,content,content_hash,occurred_at,
+          turn_id,trigger_message_id,response_kind,source,captured_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(message_id) DO UPDATE SET
+          role=excluded.role,content=excluded.content,content_hash=excluded.content_hash,
+          occurred_at=excluded.occurred_at,turn_id=excluded.turn_id,
+          trigger_message_id=excluded.trigger_message_id,response_kind=excluded.response_kind,
+          source=excluded.source,captured_at=excluded.captured_at
+      `).run(
+        messageId, sessionKey, message.platformMessageId ?? null, message.role,
+        message.content, contentHash, message.occurredAt ?? null, message.turnId ?? null,
+        message.triggerMessageId ?? null, message.responseKind ?? null, message.source, capturedAt,
+      );
+    } else {
+      this.db.prepare(`
+        UPDATE conversation_messages
+        SET occurred_at=COALESCE(occurred_at,?),turn_id=COALESCE(turn_id,?),
+          trigger_message_id=COALESCE(trigger_message_id,?),
+          response_kind=COALESCE(response_kind,?),captured_at=MAX(captured_at,?)
+        WHERE message_id=?
+      `).run(
+        message.occurredAt ?? null, message.turnId ?? null, message.triggerMessageId ?? null,
+        message.responseKind ?? null, capturedAt, messageId,
+      );
+    }
+    return existing ? 'updated' : 'inserted';
   }
 
   private insertCatalogRow(row: LogisticsSessionCatalogInput): { changes?: number | bigint } {
@@ -417,16 +523,6 @@ export class LogisticsConversationStore {
         );
         CREATE INDEX IF NOT EXISTS snapshots_master_created ON conversation_snapshots(master_key, created_at DESC);
 
-        CREATE TABLE IF NOT EXISTS conversation_messages (
-          snapshot_id TEXT NOT NULL REFERENCES conversation_snapshots(snapshot_id) ON DELETE CASCADE,
-          message_index INTEGER NOT NULL,
-          role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-          content TEXT NOT NULL,
-          platform_message_id TEXT,
-          created_at INTEGER,
-          PRIMARY KEY(snapshot_id, message_index)
-        );
-
         CREATE TABLE IF NOT EXISTS label_runs (
           run_id TEXT PRIMARY KEY,
           master_key TEXT NOT NULL REFERENCES conversations(master_key) ON DELETE CASCADE,
@@ -461,12 +557,92 @@ export class LogisticsConversationStore {
           UNIQUE(master_key, transcript_hash, harness_revision)
         );
       `);
+      if (version < 4) {
+        this.migrateConversationMessagesToFacts();
+        this.db.exec(`
+          UPDATE session_catalog
+          SET backfill_status='pending',backfill_error=NULL
+          WHERE backfill_status IN ('snapshot_ready','labeled','label_failed');
+        `);
+      }
+      this.createConversationMessagesTable();
       this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION};`);
       this.db.exec('COMMIT;');
     } catch (error) {
       this.db.exec('ROLLBACK;');
       throw error;
     }
+  }
+
+  private createConversationMessagesTable(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS conversation_messages (
+        message_id TEXT PRIMARY KEY,
+        session_key TEXT NOT NULL REFERENCES session_catalog(session_key) ON DELETE CASCADE,
+        platform_message_id TEXT,
+        role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+        content TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        occurred_at INTEGER,
+        turn_id TEXT,
+        trigger_message_id TEXT,
+        response_kind TEXT CHECK(response_kind IS NULL OR response_kind='final'),
+        source TEXT NOT NULL,
+        captured_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS conversation_messages_platform
+        ON conversation_messages(session_key,platform_message_id)
+        WHERE platform_message_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS conversation_messages_session_time
+        ON conversation_messages(session_key,occurred_at,message_id);
+    `);
+  }
+
+  private migrateConversationMessagesToFacts(): void {
+    const columns = new Set(
+      (this.db.prepare('PRAGMA table_info(conversation_messages)').all() as Array<{ name: string }>)
+        .map(column => column.name),
+    );
+    if (!columns.has('snapshot_id')) return;
+    this.db.exec('ALTER TABLE conversation_messages RENAME TO conversation_messages_v3;');
+    this.createConversationMessagesTable();
+    const legacy = this.db.prepare(`
+      SELECT m.role,m.content,m.platform_message_id,m.created_at,
+        s.created_at snapshot_created_at,c.lark_app_id,c.session_id,c.turn_id,c.answer_message_id
+      FROM conversation_messages_v3 m
+      JOIN conversation_snapshots s ON s.snapshot_id=m.snapshot_id
+      JOIN conversations c ON c.master_key=s.master_key
+      ORDER BY s.created_at,m.message_index
+    `).all() as Array<{
+      role: 'user' | 'assistant';
+      content: string;
+      platform_message_id?: string | null;
+      created_at?: number | null;
+      snapshot_created_at: number;
+      lark_app_id: string;
+      session_id: string;
+      turn_id: string;
+      answer_message_id?: string | null;
+    }>;
+    for (const row of legacy) {
+      this.upsertCapturedMessageInside({
+        larkAppId: row.lark_app_id,
+        sessionId: row.session_id,
+        role: row.role,
+        content: row.content,
+        ...(row.platform_message_id ? { platformMessageId: row.platform_message_id } : {}),
+        ...(row.created_at !== null && row.created_at !== undefined
+          ? { occurredAt: row.created_at }
+          : {}),
+        turnId: row.turn_id,
+        ...(row.role === 'assistant' ? { triggerMessageId: row.turn_id } : {}),
+        ...(row.platform_message_id && row.platform_message_id === row.answer_message_id
+          ? { responseKind: 'final' as const }
+          : {}),
+        source: 'legacy_snapshot',
+      }, row.snapshot_created_at);
+    }
+    this.db.exec('DROP TABLE conversation_messages_v3;');
   }
 
   upsert(record: LogisticsSessionMasterRecord): void {
@@ -527,12 +703,10 @@ export class LogisticsConversationStore {
       );
 
       const conversationId = publicId(record.masterKey);
-      const catalogStatus: LogisticsBackfillStatus = record.modelError
-        ? 'label_failed'
-        : record.businessCategory && record.problemType && record.resolutionStatus
-          ? 'labeled'
-          : record.transcript && record.transcriptHash ? 'snapshot_ready' : 'pending';
-      this.markSessionBackfillInside(record.larkAppId, record.sessionId, catalogStatus, record.modelError, conversationId);
+      const catalogStatus: LogisticsBackfillStatus = record.transcript && record.transcriptHash
+        ? 'captured'
+        : 'pending';
+      this.markSessionBackfillInside(record.larkAppId, record.sessionId, catalogStatus, undefined, conversationId);
 
       if (record.transcript && record.transcriptHash && record.captureState) {
         const snapshotId = `snap_${createHash('sha256').update(`${record.masterKey}:${record.transcriptHash}`).digest('hex')}`;
@@ -543,15 +717,20 @@ export class LogisticsConversationStore {
         `).run(snapshotId, record.masterKey, record.transcriptHash, record.transcript,
           record.captureState, record.messages?.length ?? 0, record.harnessRevision ?? null, record.updatedAt);
         if (record.messages?.length) {
-          const insert = this.db.prepare(`
-            INSERT OR REPLACE INTO conversation_messages
-              (snapshot_id,message_index,role,content,platform_message_id,created_at)
-            VALUES (?,?,?,?,?,?)
-          `);
-          record.messages.forEach((message, index) => insert.run(
-            snapshotId, index, message.role, message.content, message.messageId ?? null,
-            message.createdAt ?? null,
-          ));
+          record.messages.forEach(message => this.upsertCapturedMessageInside({
+            larkAppId: record.larkAppId,
+            sessionId: record.sessionId,
+            role: message.role,
+            content: message.content,
+            ...(message.messageId ? { platformMessageId: message.messageId } : {}),
+            ...(message.createdAt ? { occurredAt: message.createdAt } : {}),
+            turnId: message.role === 'user' && message.messageId ? message.messageId : record.turnId,
+            ...(message.role === 'assistant' ? { triggerMessageId: record.turnId } : {}),
+            ...(message.messageId && message.messageId === record.answerMessageId
+              ? { responseKind: 'final' as const }
+              : {}),
+            source: 'snapshot_projection',
+          }, record.updatedAt));
         }
         if (record.businessCategory && record.problemType && record.resolutionStatus && record.overallConfidence) {
           const labelId = `label_${createHash('sha256').update(`${record.masterKey}:${record.transcriptHash}:${record.harnessRevision ?? ''}`).digest('hex')}`;
@@ -570,6 +749,86 @@ export class LogisticsConversationStore {
             record.manualReviewStatus ?? 'pending', record.updatedAt);
         }
       }
+      this.db.exec('COMMIT;');
+    } catch (error) {
+      this.db.exec('ROLLBACK;');
+      throw error;
+    }
+  }
+
+  upsertCapture(record: LogisticsSessionMasterRecord, fullMessageCount: number): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.insertCatalogRow({
+        larkAppId: record.larkAppId,
+        sessionId: record.sessionId,
+        chatId: record.chatId,
+        rootMessageId: record.rootMessageId ?? '',
+        scope: record.rootMessageId ? 'thread' : 'chat',
+        sessionStatus: 'unknown',
+        title: record.title,
+        createdAt: record.createdAt,
+        lastMessageAt: record.updatedAt,
+      });
+      const existing = this.db.prepare(`
+        SELECT master_key FROM conversations WHERE lark_app_id=? AND session_id=?
+      `).get(record.larkAppId, record.sessionId) as { master_key: string } | undefined;
+      const masterKey = existing?.master_key ?? record.masterKey;
+      if (existing) {
+        this.db.prepare(`
+          UPDATE conversations SET
+            turn_id=?,chat_id=?,root_message_id=?,title=?,answer_message_id=?,
+            capture_state=?,transcript=?,transcript_hash=?,message_count=?,
+            review_reason=CASE
+              WHEN review_reason IS NULL OR review_reason='' THEN ?
+              ELSE review_reason
+            END,
+            updated_at=MAX(updated_at,?)
+          WHERE master_key=?
+        `).run(
+          record.turnId, record.chatId, record.rootMessageId, safeMetadata(record.title, 120),
+          record.answerMessageId ?? null, record.captureState ?? null, record.transcript ?? null,
+          record.transcriptHash ?? null, fullMessageCount, safeMetadata(record.reviewReason, 500),
+          record.updatedAt, masterKey,
+        );
+      } else {
+        this.db.prepare(`
+          INSERT INTO conversations (
+            master_key,public_id,lark_app_id,session_id,turn_id,survey_id,chat_id,root_message_id,
+            respondent_subject_hash,title,answer_message_id,survey_status,rating_state,rating_count,
+            capture_state,tagging_state,needs_review,review_reason,transcript,transcript_hash,
+            message_count,manual_review_status,model_attempts,created_at,updated_at
+          ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        `).run(
+          masterKey, publicId(masterKey), record.larkAppId, record.sessionId, record.turnId,
+          record.surveyId, record.chatId, record.rootMessageId, null, safeMetadata(record.title, 120),
+          record.answerMessageId ?? null, record.surveyStatus, record.ratingState, record.ratingCount,
+          record.captureState ?? null, 'needs_review', record.needsReview ? 1 : 0,
+          safeMetadata(record.reviewReason, 500), record.transcript ?? null,
+          record.transcriptHash ?? null, fullMessageCount, 'pending', 0,
+          record.createdAt, record.updatedAt,
+        );
+      }
+
+      const conversationId = publicId(masterKey);
+      if (record.transcript && record.transcriptHash && record.captureState) {
+        const snapshotId = `snap_${createHash('sha256').update(`${masterKey}:${record.transcriptHash}`).digest('hex')}`;
+        this.db.prepare(`
+          INSERT OR IGNORE INTO conversation_snapshots
+            (snapshot_id,master_key,transcript_hash,transcript,capture_state,message_count,harness_revision,created_at)
+          VALUES (?,?,?,?,?,?,?,?)
+        `).run(
+          snapshotId, masterKey, record.transcriptHash, record.transcript,
+          record.captureState, record.messages?.length ?? 0, null, record.updatedAt,
+        );
+      }
+      this.markSessionBackfillInside(
+        record.larkAppId,
+        record.sessionId,
+        'captured',
+        undefined,
+        conversationId,
+      );
       this.db.exec('COMMIT;');
     } catch (error) {
       this.db.exec('ROLLBACK;');
@@ -683,9 +942,9 @@ export class LogisticsConversationStore {
         COALESCE(SUM(c.master_key IS NOT NULL),0) conversations,
         COALESCE(SUM(c.master_key IS NOT NULL AND EXISTS(SELECT 1 FROM conversation_snapshots cs WHERE cs.master_key=c.master_key)),0) snapshotted,
         COALESCE(SUM(c.master_key IS NOT NULL AND EXISTS(SELECT 1 FROM conversation_labels cl WHERE cl.master_key=c.master_key)),0) labeled,
-        COALESCE(SUM(sc.backfill_status IN ('pending','processing','missing_turn','missing_answer')),0) pending_backfill,
-        COALESCE(SUM(sc.backfill_status IN ('history_failed','label_failed')),0) failed_backfill,
-        COALESCE(SUM(c.message_count),0) messages,
+        COALESCE(SUM(sc.backfill_status IN ('pending','processing')),0) pending_backfill,
+        COALESCE(SUM(sc.backfill_status IN ('missing_turn','missing_answer','history_failed')),0) failed_backfill,
+        COALESCE(SUM((SELECT COUNT(*) FROM conversation_messages cm WHERE cm.session_key=sc.session_key)),0) messages,
         COALESCE(SUM(c.resolution_status='resolved'),0) resolved,
         COALESCE(SUM(c.resolution_status='in_progress'),0) in_progress,
         COALESCE(SUM(c.master_key IS NOT NULL AND (c.resolution_status='unknown' OR c.resolution_status IS NULL)),0) unknown_count,
@@ -780,7 +1039,8 @@ export class LogisticsConversationStore {
         COALESCE(sc.last_message_at,sc.closed_at,sc.created_at) session_updated_at,
         c.public_id conversation_id,c.capture_state,c.tagging_state,c.business_category,
         c.problem_type,c.resolution_status,c.overall_confidence,c.needs_review,c.review_reason,
-        c.rating,c.rating_count,c.message_count
+        c.rating,c.rating_count,
+        (SELECT COUNT(*) FROM conversation_messages cm WHERE cm.session_key=sc.session_key) message_count
       ${joins} ${w.sql}
       ORDER BY session_updated_at DESC,sc.session_key DESC LIMIT ? OFFSET ?
     `).all(...w.params, limit, offset) as any[];
@@ -801,16 +1061,14 @@ export class LogisticsConversationStore {
       SELECT snapshot_id,transcript_hash,capture_state,message_count,harness_revision,created_at
       FROM conversation_snapshots WHERE master_key=? ORDER BY created_at DESC
     `).all(row.master_key) as any[];
-    const currentSnapshot = snapshotRows.find(item => item.transcript_hash === row.transcript_hash) ?? snapshotRows[0];
-    const messages = currentSnapshot
-      ? (this.db.prepare(`
-          SELECT role,content,platform_message_id,created_at FROM conversation_messages
-          WHERE snapshot_id=? ORDER BY message_index
-        `).all(currentSnapshot.snapshot_id) as any[]).map(item => ({
-          role: String(item.role), content: String(item.content),
-          ...(item.created_at ? { createdAt: Number(item.created_at) } : {}),
-        }))
-      : [];
+    const sessionKey = `${row.lark_app_id}:${row.session_id}`;
+    const messages = (this.db.prepare(`
+      SELECT role,content,platform_message_id,occurred_at FROM conversation_messages
+      WHERE session_key=? ORDER BY occurred_at IS NULL,occurred_at,message_id
+    `).all(sessionKey) as any[]).map(item => ({
+      role: String(item.role), content: String(item.content),
+      ...(item.occurred_at ? { createdAt: Number(item.occurred_at) } : {}),
+    }));
     return {
       ...this.catalogListItem({
         ...row, conversation_id: row.public_id, session_public_id: row.session_public_id,

@@ -79,6 +79,7 @@ describe('standalone logistics analytics server', () => {
       expect(pageText).toContain('物流专家 · 数据概览');
       expect(pageText).toContain('分析覆盖率');
       expect(pageText).toContain('全部数据状态');
+      expect(pageText).toContain('已采集');
       expect(pageText).toContain('电子面单 / 在线寄件');
       expect(pageText).toContain('LB / LP 枚举速查');
       const exchange = await fetch(`${base}/overview?t=secret`, {

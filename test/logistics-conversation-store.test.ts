@@ -2,6 +2,7 @@ import { writeFile } from 'node:fs/promises';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -145,6 +146,150 @@ describe('logistics conversation SQLite store', () => {
     });
     store.close();
   });
+
+  it('stores message facts idempotently and capture-only updates preserve labels and ratings', async () => {
+    const dataDir = await tempDir();
+    const store = new LogisticsConversationStore({ dataDir });
+    store.upsert(record());
+
+    const messages = [
+      {
+        larkAppId: 'cli_logistics',
+        sessionId: 'session-1',
+        platformMessageId: 'om_turn',
+        role: 'user' as const,
+        content: '完整问题\n第二行',
+        occurredAt: 1_000,
+        turnId: 'om_turn',
+        source: 'lark_history' as const,
+      },
+      {
+        larkAppId: 'cli_logistics',
+        sessionId: 'session-1',
+        platformMessageId: 'om_answer',
+        role: 'assistant' as const,
+        content: '完整回答',
+        occurredAt: 2_000,
+        turnId: 'om_turn',
+        triggerMessageId: 'om_turn',
+        responseKind: 'final' as const,
+        source: 'botmux_send_marker' as const,
+      },
+    ];
+    expect(store.upsertCapturedMessages(messages)).toEqual({
+      total: 2,
+      inserted: 0,
+      updated: 2,
+    });
+    expect(store.upsertCapturedMessages(messages)).toEqual({
+      total: 2,
+      inserted: 0,
+      updated: 2,
+    });
+
+    store.upsertCapture(record({
+      transcript: '用户：完整问题 助手：完整回答',
+      transcriptHash: 'd'.repeat(64),
+      messages: [
+        { role: 'user', content: '完整问题', messageId: 'om_turn', createdAt: 1_000 },
+        { role: 'assistant', content: '完整回答', messageId: 'om_answer', createdAt: 2_000 },
+      ],
+      taggingState: 'needs_review',
+      businessCategory: undefined,
+      problemType: undefined,
+      resolutionStatus: undefined,
+      overallConfidence: undefined,
+      harnessRevision: undefined,
+      rating: undefined,
+      ratingCount: 0,
+      ratingState: 'awaiting',
+      modelAttempts: 0,
+    }), messages.length);
+
+    expect(store.summary()).toMatchObject({
+      conversations: 1,
+      messages: 2,
+      labeled: 1,
+      resolved: 1,
+    });
+    expect(store.list({ dataStatus: 'captured' })).toMatchObject({
+      total: 1,
+      items: [expect.objectContaining({
+        rating: 5,
+        businessCategory: 'LB02',
+        problemType: 'LP05',
+        resolutionStatus: 'resolved',
+        dataStatus: 'captured',
+        messageCount: 2,
+      })],
+    });
+    expect(store.detail('conv_21c9e882b55ee6e94b898e21d3ce80d5')).toMatchObject({
+      harnessRevision: 'b'.repeat(64),
+      messages: [
+        { role: 'user', content: '完整问题\n第二行', createdAt: 1_000 },
+        { role: 'assistant', content: '完整回答', createdAt: 2_000 },
+      ],
+    });
+    store.close();
+  });
+
+  it('migrates v3 snapshot messages into independent v4 message facts', async () => {
+    const dataDir = await tempDir();
+    const path = join(dataDir, 'botmux-conversations.sqlite');
+    const initial = new LogisticsConversationStore({ dataDir });
+    initial.upsert(record());
+    initial.close();
+
+    const legacy = new DatabaseSync(path);
+    const snapshotId = String((legacy.prepare(`
+      SELECT snapshot_id FROM conversation_snapshots LIMIT 1
+    `).get() as { snapshot_id: string }).snapshot_id);
+    legacy.exec(`
+      DROP TABLE conversation_messages;
+      CREATE TABLE conversation_messages (
+        snapshot_id TEXT NOT NULL REFERENCES conversation_snapshots(snapshot_id) ON DELETE CASCADE,
+        message_index INTEGER NOT NULL,
+        role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+        content TEXT NOT NULL,
+        platform_message_id TEXT,
+        created_at INTEGER,
+        PRIMARY KEY(snapshot_id, message_index)
+      );
+      UPDATE session_catalog SET backfill_status='labeled';
+      PRAGMA user_version=3;
+    `);
+    const insert = legacy.prepare(`
+      INSERT INTO conversation_messages
+        (snapshot_id,message_index,role,content,platform_message_id,created_at)
+      VALUES (?,?,?,?,?,?)
+    `);
+    insert.run(snapshotId, 0, 'user', '问题', 'om_turn', 1_000);
+    insert.run(snapshotId, 1, 'assistant', '回答', 'om_answer', 2_000);
+    legacy.close();
+
+    const migrated = new LogisticsConversationStore({ dataDir });
+    expect(migrated.summary()).toMatchObject({
+      conversations: 1,
+      messages: 2,
+      labeled: 1,
+      pendingBackfill: 1,
+    });
+    expect(migrated.detail('conv_21c9e882b55ee6e94b898e21d3ce80d5')).toMatchObject({
+      messages: [
+        { role: 'user', content: '问题', createdAt: 1_000 },
+        { role: 'assistant', content: '回答', createdAt: 2_000 },
+      ],
+    });
+    migrated.close();
+
+    const verified = new DatabaseSync(path, { readOnly: true });
+    expect((verified.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(4);
+    const columns = (verified.prepare('PRAGMA table_info(conversation_messages)').all() as Array<{ name: string }>)
+      .map(column => column.name);
+    expect(columns).toContain('session_key');
+    expect(columns).not.toContain('snapshot_id');
+    verified.close();
+  });
 });
 
 describe('logistics session catalog coverage', () => {
@@ -178,9 +323,9 @@ describe('logistics session catalog coverage', () => {
     });
     expect(store.list({ dataStatus: 'pending' })).toMatchObject({ total: 2 });
     expect(store.list({ dataStatus: 'pending' }).items[0]).not.toHaveProperty('conversationId');
-    expect(store.list({ dataStatus: 'labeled' }).items[0]).toMatchObject({
+    expect(store.list({ dataStatus: 'captured' }).items[0]).toMatchObject({
       conversationId: expect.stringMatching(/^conv_/),
-      dataStatus: 'labeled',
+      dataStatus: 'captured',
     });
     store.close();
   });

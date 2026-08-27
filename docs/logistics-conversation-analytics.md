@@ -1,19 +1,23 @@
 # Logistics conversation analytics MVP
 
-This feature builds on the logistics-expert implementation that already records
-post-turn satisfaction and semantic tags. It replaces the Lark Base-only data
-path with a local SQLite fact store and adds a standalone, read-only internal
-site. It deliberately does not add a BotMux Dashboard page.
+This feature builds a local SQLite fact store for logistics-expert sessions,
+messages, satisfaction, and semantic labels, plus a standalone read-only
+internal site. It deliberately does not add a BotMux Dashboard page.
 
 ## Runtime flow
 
 ```text
-canonical final delivery
-  -> logistics session master row
-  -> visible Lark history snapshot
-  -> order-delivery labeling Harness
+BotMux session catalog
+  -> botmux logistics backfill
+  -> complete visible Lark history + BotMux send marker
+  -> sanitized message facts
+  -> bounded 12,000-character snapshot when turn/final boundaries exist
   -> botmux-conversations.sqlite
-  -> optional Lark Base review projection
+
+independent labeling command
+  -> snapshot
+  -> order-delivery labeling Harness
+  -> semantic label projection
 
 Nginx / internal domain
   -> botmux analytics serve (loopback)
@@ -26,8 +30,10 @@ writing.
 
 ## Privacy boundary
 
-- Snapshot messages contain only visible user/assistant content and are sanitized
-  before persistence.
+- Message facts contain only visible user/assistant content and are sanitized
+  before persistence without truncating the message body.
+- Snapshots are derived from those messages and bounded to the configured
+  transcript limit (12,000 characters by default).
 - App-scoped respondent open IDs are stored only as SHA-256 hashes in SQLite.
 - Hidden reasoning, terminal output, credentials, attachments, and raw Lark
   payloads are not stored.
@@ -36,9 +42,18 @@ writing.
 
 ## Operations
 
-`botmux logistics backfill` is dry-run by default. `--apply` is bounded by bot,
-time, optional session prefix, and `--limit` (maximum 500). It never scans every
-chat without an existing BotMux session record.
+`botmux logistics backfill` is a capture-only command and is dry-run by default.
+It never invokes the labeling Harness or a model. `--apply` is bounded by bot,
+time, optional session prefix, cursor, and `--limit` (maximum 500). It never
+scans a chat without an existing BotMux session record.
+
+Thread sessions fetch the complete visible topic. Chat sessions page backward
+from the newest message to the Session start boundary, retain only the Session
+time window, and fail explicitly instead of silently truncating if the
+5,000-message safety limit is reached. Message writes are idempotent by Session
+and platform message ID. Missing turn/final boundaries do not discard messages:
+the facts remain stored and the catalog records `missing_turn` or
+`missing_answer`.
 
 The analytics server binds to loopback by default. A non-loopback bind is refused
 unless `BOTMUX_ANALYTICS_TOKEN` is set. For first login, `/overview?t=<token>`

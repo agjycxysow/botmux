@@ -44,13 +44,26 @@ function snapshotRole(senderType: string | undefined): LogisticsSnapshotMessage[
   return undefined;
 }
 
-export function sanitizeLogisticsSessionText(value: string, maxChars = DEFAULT_MAX_TRANSCRIPT_CHARS): string {
-  const normalized = value
+function redactLogisticsMessageText(value: string): string {
+  return value
     .replace(/\bou_[A-Za-z0-9_]+\b/g, '[成员]')
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[邮箱]')
     .replace(/\b1[3-9]\d{9}\b/g, '[手机号]')
     .replace(/\b\d{8,}\b/g, '[编号]')
-    .replace(/(?:https?|ftp):\/\/\S+/gi, '[链接]')
+    .replace(/(?:https?|ftp):\/\/\S+/gi, '[链接]');
+}
+
+export function sanitizeLogisticsMessageText(value: string): string {
+  return redactLogisticsMessageText(value)
+    .replace(/\r\n?/g, '\n')
+    .replace(/[^\S\n]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+export function sanitizeLogisticsSessionText(value: string, maxChars = DEFAULT_MAX_TRANSCRIPT_CHARS): string {
+  const normalized = sanitizeLogisticsMessageText(value)
     .replace(/\s+/g, ' ')
     .trim();
   const chars = Array.from(normalized);

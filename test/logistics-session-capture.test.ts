@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildLogisticsSessionSnapshot,
+  sanitizeLogisticsMessageText,
   sanitizeLogisticsSessionText,
 } from '../src/services/logistics-session-capture.js';
 
@@ -57,5 +58,14 @@ describe('logistics session capture', () => {
       reviewReason: expect.any(String),
     });
     expect(sanitizeLogisticsSessionText('a@b.com 13900000000 ou_secret')).toBe('[邮箱] [手机号] [成员]');
+  });
+
+  it('keeps full message text and line breaks outside the bounded snapshot', () => {
+    const text = `第一行\n${'内容'.repeat(7_000)}\n13800000000`;
+    const sanitized = sanitizeLogisticsMessageText(text);
+    expect(sanitized).toContain('第一行\n');
+    expect(sanitized).toContain('\n[手机号]');
+    expect(sanitized.length).toBeGreaterThan(12_000);
+    expect(sanitizeLogisticsSessionText(text)).toHaveLength(12_000);
   });
 });
