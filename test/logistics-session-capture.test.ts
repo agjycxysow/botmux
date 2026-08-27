@@ -31,6 +31,23 @@ describe('logistics session capture', () => {
     expect(snapshot.transcriptHash).toMatch(/^[a-f0-9]{64}$/);
   });
 
+
+  it('treats an explicit chat-scope user/assistant turn window as complete', () => {
+    expect(buildLogisticsSessionSnapshot({
+      rootMessageId: null,
+      turnId: 'om_turn',
+      answerMessageId: 'om_answer',
+      messages: [
+        { messageId: 'om_old', senderType: 'app', content: '旧答' },
+        { messageId: 'om_turn', senderType: 'user', content: '新问' },
+        { messageId: 'om_answer', senderType: 'app', content: '新答' },
+      ],
+    })).toMatchObject({
+      captureState: 'complete',
+      messages: [{ role: 'user', content: '新问' }, { role: 'assistant', content: '新答' }],
+    });
+  });
+
   it('marks missing boundaries as partial rather than claiming a complete segment', () => {
     expect(buildLogisticsSessionSnapshot({
       turnId: 'om_missing',

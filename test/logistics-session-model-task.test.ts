@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  buildLogisticsHarnessInput,
   buildLogisticsModelTaskPrompt,
   createLogisticsSessionModelTaskRunner,
   parseLogisticsModelTaskOutput,
@@ -49,6 +50,37 @@ describe('logistics session model task', () => {
     expect(buildLogisticsModelTaskPrompt(record)).not.toContain(record.masterKey);
   });
 
+
+  it('parses the versioned Harness contract and builds the validator-compatible input hash', () => {
+    const harness = parseLogisticsModelTaskOutput(JSON.stringify({
+      schema_version: '1.0',
+      harness_revision: 'a'.repeat(64),
+      capture_state: 'complete',
+      business: { id: 'LB02', confidence: 'high', reason_code: 'primary_domain_fulfillment', evidence_anchors: [{ role: 'domain', message_index: 0 }] },
+      problem_type: { id: 'LP03', confidence: 'high', reason_code: 'code_or_api_trace_requested', evidence_anchors: [{ role: 'goal', message_index: 0 }] },
+      resolution: { status: 'resolved', confidence: 'high', reason_code: 'requested_trace_delivered', evidence_anchors: [{ role: 'goal', message_index: 0 }, { role: 'outcome', message_index: 1 }] },
+      needs_review: false,
+      review_reason: '',
+      manual_review: { status: 'pending' },
+    }));
+    expect(harness).toMatchObject({
+      businessCategory: 'LB02',
+      problemType: 'LP03',
+      resolutionStatus: 'resolved',
+      harnessRevision: 'a'.repeat(64),
+      businessReasonCode: 'primary_domain_fulfillment',
+      evidenceAnchors: expect.arrayContaining([
+        { role: 'domain', messageIndex: 0 },
+        { role: 'outcome', messageIndex: 1 },
+      ]),
+    });
+    const input = buildLogisticsHarnessInput({
+      ...record,
+      captureState: 'complete',
+      messages: [{ role: 'user', content: '问' }, { role: 'assistant', content: '答' }],
+    });
+    expect(input.transcript_hash).toBe('4142dcdf6ead914689172f2589ff054ccf1d8034b12ca59aa2b6557373b35612');
+  });
   it('runs the isolated one-shot model task with an ephemeral read-only Codex invocation', async () => {
     const exec = vi.fn(async (_file: string, args: string[]) => {
       const outputPath = args[args.indexOf('--output-last-message') + 1]!;

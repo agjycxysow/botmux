@@ -333,3 +333,62 @@ The following fields are written by botmux itself and persisted into `bots.json`
 | `noCardChats` | The "don't send streaming cards in this group" list written by `/card off\|on` |
 
 > **Configuration precedence**: the `BOTS_CONFIG` environment variable → `~/.botmux/bots.json`. Run `botmux restart` after editing to take effect.
+
+## Logistics conversation SQLite and labeling
+
+`logisticsSessionMaster` can keep the logistics conversation projection in local
+SQLite while optionally retaining the existing Lark Base review projection:
+
+```json
+{
+  "logisticsSessionMaster": {
+    "enabled": true,
+    "sqlite": { "enabled": true },
+    "harness": {
+      "rootDir": "/path/to/order-delivery-codex-workspace"
+    },
+    "modelTask": {
+      "enabled": true,
+      "timeoutMs": 90000
+    }
+  }
+}
+```
+
+- SQLite defaults to `${SESSION_DATA_DIR}/botmux-conversations.sqlite`; set
+  `sqlite.path` only when the deployment needs an explicit absolute path.
+- `larkBase` is optional. When present it remains a best-effort human-review
+  projection; SQLite is written independently and Base failures do not block
+  conversation processing.
+- `harness.rootDir` points at the order-delivery workspace containing
+  `.agents/skills/logistics-conversation-labeler` and `00-Harness`. The one-shot
+  model result must pass that workspace's deterministic validator before it is
+  stored. Without a valid Harness root BotMux uses the built-in bounded fallback
+  taxonomy.
+- The accepted resolution states are `resolved`, `in_progress`, and `unknown`.
+  Historical `unresolved` rows migrate to review-safe `unknown`.
+- Final delivery creates the master row even when no satisfaction survey is sent;
+  a later rating updates the same row.
+
+Historical operations are explicit and bounded:
+
+```bash
+# Audit only (default): list candidates without Lark reads or SQLite writes.
+botmux logistics backfill --bot cli_xxx --since 2026-08-01 --limit 50
+
+# Fetch visible Lark history, run the same labeler, and write SQLite.
+botmux logistics backfill --bot cli_xxx --since 2026-08-01 --limit 50 \
+  --harness-root /path/to/order-delivery-codex-workspace --apply
+
+# Import the existing logistics-session-master/*.json projection only.
+botmux logistics import-legacy --bot cli_xxx
+```
+
+The standalone site does not register a Dashboard route:
+
+```bash
+BOTMUX_ANALYTICS_TOKEN='long-random-value' botmux analytics serve \
+  --host 127.0.0.1 --port 17870
+```
+
+See `deploy/logistics-analytics/` for the Nginx and user-systemd examples.

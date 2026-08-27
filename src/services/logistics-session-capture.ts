@@ -13,6 +13,14 @@ export interface LogisticsSessionSnapshot {
   captureState: 'complete' | 'partial';
   reviewReason?: string;
   messageCount: number;
+  messages?: LogisticsSnapshotMessage[];
+}
+
+export interface LogisticsSnapshotMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  messageId?: string;
+  createdAt?: number;
 }
 
 export interface BuildLogisticsSessionSnapshotInput {
@@ -28,6 +36,12 @@ const DEFAULT_MAX_TRANSCRIPT_CHARS = 12_000;
 
 function roleForMessage(senderType: string | undefined): string {
   return senderType === 'user' ? '用户' : senderType === 'app' ? '助手' : '消息';
+}
+
+function snapshotRole(senderType: string | undefined): LogisticsSnapshotMessage['role'] | undefined {
+  if (senderType === 'user') return 'user';
+  if (senderType === 'app') return 'assistant';
+  return undefined;
 }
 
 export function sanitizeLogisticsSessionText(value: string, maxChars = DEFAULT_MAX_TRANSCRIPT_CHARS): string {
@@ -81,30 +95,43 @@ export function buildLogisticsSessionSnapshot(
           : Math.max(0, input.messages.length - 2);
   const end = answerIndex >= start ? answerIndex : input.messages.length - 1;
   const selected = input.messages.slice(start, end + 1);
+  const messages = selected.flatMap(message => {
+    const role = snapshotRole(message.senderType);
+    const content = sanitizeLogisticsSessionText(message.content, 2_000);
+    if (!role || !content) return [];
+    const createdAt = Number(message.createTime);
+    return [{
+      role,
+      content,
+      ...(message.messageId ? { messageId: message.messageId } : {}),
+      ...(Number.isFinite(createdAt) ? { createdAt } : {}),
+    } satisfies LogisticsSnapshotMessage];
+  });
   const transcript = sanitizeLogisticsSessionText(
-    selected
-      .map(message => {
-        const content = sanitizeLogisticsSessionText(message.content, 2_000);
-        return content ? `${roleForMessage(message.senderType)}：${content}` : '';
-      })
-      .filter(Boolean)
-      .join('\n'),
+    messages.map(message => `${message.role === 'user' ? '用户' : '助手'}：${message.content}`).join('\n'),
     maxTranscriptChars,
   );
+  const explicitTurnWindow = !input.rootMessageId
+    && turnIndex >= 0
+    && answerIndex >= turnIndex;
   const captureState = turnIndex >= 0
     && (answerIndex < 0 || answerIndex >= turnIndex)
-    && (rootBelongsToSession || sessionStartIndex >= 0)
+    && (rootBelongsToSession || sessionStartIndex >= 0 || explicitTurnWindow)
     ? 'complete'
     : 'partial';
   const reviewReason = captureState === 'partial'
     ? '未完整定位本轮起止消息，已保留可识别片段'
     : undefined;
 
+  const transcriptHash = createHash('sha256')
+    .update(JSON.stringify(messages.map(({ role, content }) => ({ content, role }))))
+    .digest('hex');
   return {
     transcript,
-    transcriptHash: createHash('sha256').update(transcript).digest('hex'),
+    transcriptHash,
     captureState,
     ...(reviewReason ? { reviewReason } : {}),
-    messageCount: selected.length,
+    messageCount: messages.length,
+    messages,
   };
 }

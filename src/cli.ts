@@ -7288,6 +7288,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               botmux restart --bootstrap-shutdown-protocol --yes；普通 stop/restart 仍保持 fail-closed
   logs        查看 daemon 日志（--lines N, --bot <0-based-index|pm2-name|appId>）
   status      查看 daemon 状态
+  logistics backfill|import-legacy
+              物流会话 SQLite：有界历史回溯（默认 dry-run）或导入旧 JSON
+  analytics serve
+              启动独立只读数据概览站点（不进入 BotMux Dashboard）
   upgrade     升级到最新版本（别名：update）
   dashboard current
               获取当前 Web Dashboard 登录 URL（裸 \`dashboard\` 同义；没有则创建）
@@ -14442,6 +14446,16 @@ switch (command) {
   case 'goal': {
     const { cmdGoal } = await import('./workflows/v3/goal-cli.js');
     process.exitCode = await cmdGoal(process.argv[3] ?? '', process.argv.slice(4));
+    break;
+  }
+  case 'logistics': {
+    const { runLogisticsConversationCommand } = await import('./cli/logistics-conversation.js');
+    await runLogisticsConversationCommand(process.argv[3] ?? '', process.argv.slice(4), resolveDataDir());
+    break;
+  }
+  case 'analytics': {
+    const { runLogisticsAnalyticsCommand } = await import('./cli/logistics-analytics.js');
+    await runLogisticsAnalyticsCommand(process.argv[3] ?? '', process.argv.slice(4), resolveDataDir());
     break;
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;

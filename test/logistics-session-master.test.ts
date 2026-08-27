@@ -60,6 +60,40 @@ describe('logistics session master', () => {
     });
   });
 
+
+  it('creates a SQLite-backed row on final delivery without waiting for a survey card', async () => {
+    const dataDir = await makeDataDir();
+    const manager = new LogisticsSessionMasterManager({
+      dataDir,
+      larkAppId: 'cli_logistics',
+      config: { enabled: true, modelTask: { enabled: true } },
+      captureSession: vi.fn(async () => ({
+        transcript: '用户：问\n助手：答',
+        transcriptHash: 'd'.repeat(64),
+        captureState: 'complete' as const,
+        messageCount: 2,
+        messages: [{ role: 'user' as const, content: '问' }, { role: 'assistant' as const, content: '答' }],
+      })),
+      runModelTask: vi.fn(async () => ({
+        businessCategory: 'LB02', problemType: 'LP01', resolutionStatus: 'resolved' as const,
+        overallConfidence: 'high' as const, needsReview: false,
+      })),
+    });
+    manager.start();
+    manager.noteTurnCompleted({
+      larkAppId: 'cli_logistics', sessionId: 'session-final', turnId: 'om_turn',
+      chatId: 'oc_final', rootMessageId: 'om_root', answerMessageId: 'om_answer', title: 'final',
+    });
+    await vi.waitFor(() => expect(manager.listRecords()[0]).toMatchObject({
+      sessionId: 'session-final', taggingState: 'tagged', resolutionStatus: 'resolved',
+    }));
+    const { LogisticsConversationStore } = await import('../src/services/logistics-conversation-store.js');
+    const store = new LogisticsConversationStore({ dataDir, readOnly: true });
+    expect(store.summary()).toMatchObject({ conversations: 1, resolved: 1 });
+    store.close();
+    manager.stop();
+  });
+
   it('writes once after dispatch and updates the same row when a rating arrives', async () => {
     const dataDir = await makeDataDir();
     const upsertBase = vi.fn(async () => ({ recordId: 'rec_master_1' }));
@@ -210,10 +244,15 @@ describe('logistics session master', () => {
     manager.stop();
   });
 
-  it('stays inert until a complete Base binding is configured', () => {
+  it('enables SQLite without requiring a Base binding', () => {
     expect(normalizeLogisticsSessionMasterConfig({ enabled: true })).toMatchObject({
-      enabled: false,
+      enabled: true,
+      sqlite: { enabled: true },
       modelTask: { enabled: false },
     });
+    expect(normalizeLogisticsSessionMasterConfig({
+      enabled: true,
+      sqlite: { enabled: false },
+    }).enabled).toBe(false);
   });
 });

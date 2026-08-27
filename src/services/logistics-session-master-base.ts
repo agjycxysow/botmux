@@ -123,7 +123,6 @@ function problemLabel(value: string | undefined): string | undefined {
 function resolutionLabel(value: LogisticsSessionMasterRecord['resolutionStatus']): string | undefined {
   const labels: Record<NonNullable<LogisticsSessionMasterRecord['resolutionStatus']>, string> = {
     resolved: '已解决',
-    unresolved: '未解决',
     in_progress: '处理中',
     unknown: '未知',
   };

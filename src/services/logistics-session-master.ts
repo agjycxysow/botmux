@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 import type { FeedbackSurveyRecord } from './feedback-survey.js';
-import type { LogisticsSessionSnapshot } from './logistics-session-capture.js';
+import type { LogisticsSessionSnapshot, LogisticsSnapshotMessage } from './logistics-session-capture.js';
+import { LogisticsConversationStore } from './logistics-conversation-store.js';
 
 const DEFAULT_MODEL_TIMEOUT_MS = 90_000;
 const DEFAULT_MAX_TRANSCRIPT_CHARS = 12_000;
@@ -15,6 +16,13 @@ export interface LogisticsSessionMasterConfig {
     appToken: string;
     tableId: string;
     identity?: 'user' | 'bot';
+  };
+  sqlite?: {
+    enabled?: boolean;
+    path?: string;
+  };
+  harness?: {
+    rootDir?: string;
   };
   modelTask?: {
     enabled?: boolean;
@@ -37,11 +45,23 @@ export interface NormalizedLogisticsSessionMasterConfig {
     tableId: string;
     identity: 'user' | 'bot';
   };
+  sqlite: {
+    enabled: boolean;
+    path?: string;
+  };
+  harness: {
+    rootDir?: string;
+  };
 }
 
 export type LogisticsConfidence = 'high' | 'medium' | 'low';
-export type LogisticsResolutionStatus = 'resolved' | 'unresolved' | 'in_progress' | 'unknown';
+export type LogisticsResolutionStatus = 'resolved' | 'in_progress' | 'unknown';
 export type LogisticsTaggingState = 'pending_capture' | 'tagging' | 'tagged' | 'needs_review';
+
+export interface LogisticsEvidenceAnchor {
+  role: 'goal' | 'domain' | 'outcome' | 'open_item' | 'failure';
+  messageIndex: number;
+}
 
 export interface LogisticsModelTagging {
   businessCategory: string;
@@ -50,6 +70,12 @@ export interface LogisticsModelTagging {
   overallConfidence: LogisticsConfidence;
   needsReview: boolean;
   reviewReason?: string;
+  harnessRevision?: string;
+  businessReasonCode?: string;
+  problemReasonCode?: string;
+  resolutionReasonCode?: string;
+  evidenceAnchors?: LogisticsEvidenceAnchor[];
+  manualReviewStatus?: 'pending';
 }
 
 export interface LogisticsSessionMasterRecord {
@@ -63,6 +89,7 @@ export interface LogisticsSessionMasterRecord {
   chatId: string;
   rootMessageId: string | null;
   respondentOpenId: string;
+  title?: string;
   recap?: string;
   answerMessageId?: string;
   surveyStatus: FeedbackSurveyRecord['status'];
@@ -74,6 +101,7 @@ export interface LogisticsSessionMasterRecord {
   transcript?: string;
   transcriptHash?: string;
   captureState?: LogisticsSessionSnapshot['captureState'];
+  messages?: LogisticsSnapshotMessage[];
   taggingState: LogisticsTaggingState;
   businessCategory?: string;
   problemType?: string;
@@ -81,6 +109,12 @@ export interface LogisticsSessionMasterRecord {
   overallConfidence?: LogisticsConfidence;
   needsReview: boolean;
   reviewReason?: string;
+  harnessRevision?: string;
+  businessReasonCode?: string;
+  problemReasonCode?: string;
+  resolutionReasonCode?: string;
+  evidenceAnchors?: LogisticsEvidenceAnchor[];
+  manualReviewStatus?: 'pending';
   modelAttempts: number;
   modelError?: string;
   baseRecordId?: string;
@@ -103,6 +137,17 @@ export type LogisticsSessionSnapshotLoader = (input: {
 export type LogisticsSessionModelTaskRunner = (input: {
   record: LogisticsSessionMasterRecord;
 }) => Promise<LogisticsModelTagging>;
+
+export interface LogisticsSessionTurnCompletedInput {
+  larkAppId: string;
+  sessionId: string;
+  turnId: string;
+  chatId: string;
+  rootMessageId: string | null;
+  respondentOpenId?: string;
+  title?: string;
+  answerMessageId?: string;
+}
 
 export interface LogisticsSessionMasterManagerOptions {
   dataDir: string;
@@ -141,13 +186,22 @@ export function normalizeLogisticsSessionMasterConfig(
   const raw = asRecord(input);
   const rawBase = asRecord(raw?.larkBase);
   const rawModelTask = asRecord(raw?.modelTask);
+  const rawSqlite = asRecord(raw?.sqlite);
+  const rawHarness = asRecord(raw?.harness);
   const appToken = optionalText(rawBase?.appToken);
   const tableId = optionalText(rawBase?.tableId);
   const larkBase = appToken && tableId
     ? { appToken, tableId, identity: rawBase?.identity === 'user' ? 'user' as const : 'bot' as const }
     : undefined;
+  const sqlitePath = optionalText(rawSqlite?.path);
+  const sqlite = {
+    enabled: rawSqlite?.enabled !== false,
+    ...(sqlitePath ? { path: sqlitePath } : {}),
+  };
+  const harnessRoot = optionalText(rawHarness?.rootDir)
+    ?? optionalText(process.env.LOGISTICS_CONVERSATION_HARNESS_ROOT);
   return {
-    enabled: raw?.enabled === true && !!larkBase,
+    enabled: raw?.enabled === true && (sqlite.enabled || !!larkBase),
     maxTranscriptChars: boundedInt(raw?.maxTranscriptChars, DEFAULT_MAX_TRANSCRIPT_CHARS, 30_000),
     modelTask: {
       enabled: rawModelTask?.enabled === true,
@@ -155,6 +209,8 @@ export function normalizeLogisticsSessionMasterConfig(
       ...(optionalText(rawModelTask?.model) ? { model: optionalText(rawModelTask?.model) } : {}),
     },
     larkBase,
+    sqlite,
+    harness: { ...(harnessRoot ? { rootDir: harnessRoot } : {}) },
   };
 }
 
@@ -192,16 +248,25 @@ export class LogisticsSessionMasterManager {
   private readonly baseSyncs = new Map<string, Promise<void>>();
   private readonly baseRetryTimers = new Map<string, NodeJS.Timeout>();
   private baseWriteTail: Promise<void> = Promise.resolve();
+  private conversationStore?: LogisticsConversationStore;
+  private readonly sqliteFingerprints = new Map<string, string>();
   private started = false;
 
   constructor(private readonly options: LogisticsSessionMasterManagerOptions) {
     this.config = normalizeLogisticsSessionMasterConfig(options.config);
+    if (this.config.enabled && this.config.sqlite.enabled) {
+      this.conversationStore = new LogisticsConversationStore({
+        dataDir: options.dataDir,
+        ...(this.config.sqlite.path ? { path: this.config.sqlite.path } : {}),
+      });
+    }
   }
 
   start(): void {
     if (this.started || !this.config.enabled) return;
     this.started = true;
     this.load();
+    this.conversationStore?.importLegacyJson(this.options.dataDir, this.options.larkAppId);
     for (const record of this.records.values()) {
       if (record.taggingState === 'pending_capture') this.queue(record.masterKey);
       if (record.taggingState === 'tagging') {
@@ -219,6 +284,8 @@ export class LogisticsSessionMasterManager {
     this.started = false;
     for (const timer of this.baseRetryTimers.values()) clearTimeout(timer);
     this.baseRetryTimers.clear();
+    this.conversationStore?.close();
+    this.conversationStore = undefined;
   }
 
   listRecords(): LogisticsSessionMasterRecord[] {
@@ -246,8 +313,9 @@ export class LogisticsSessionMasterManager {
       ratingCount: prior?.ratingCount ?? 0,
       chatId: survey.chatId,
       rootMessageId: survey.rootMessageId,
-      respondentOpenId: survey.respondentOpenId,
-      recap: survey.recap,
+      respondentOpenId: survey.respondentOpenId || prior?.respondentOpenId || '',
+      title: survey.title ?? prior?.title,
+      recap: survey.recap ?? prior?.recap,
       answerMessageId: survey.answerMessageId,
       surveyStatus: survey.status,
       dueAt: survey.dueAt,
@@ -265,6 +333,13 @@ export class LogisticsSessionMasterManager {
       transcript: isNewTurn ? undefined : prior?.transcript,
       transcriptHash: isNewTurn ? undefined : prior?.transcriptHash,
       captureState: isNewTurn ? undefined : prior?.captureState,
+      messages: isNewTurn ? undefined : prior?.messages,
+      harnessRevision: isNewTurn ? undefined : prior?.harnessRevision,
+      businessReasonCode: isNewTurn ? undefined : prior?.businessReasonCode,
+      problemReasonCode: isNewTurn ? undefined : prior?.problemReasonCode,
+      resolutionReasonCode: isNewTurn ? undefined : prior?.resolutionReasonCode,
+      evidenceAnchors: isNewTurn ? undefined : prior?.evidenceAnchors,
+      manualReviewStatus: prior?.manualReviewStatus ?? 'pending',
       modelAttempts: isNewTurn ? 0 : prior?.modelAttempts ?? 0,
       modelError: isNewTurn ? undefined : prior?.modelError,
       baseRecordId: prior?.baseRecordId,
@@ -277,8 +352,72 @@ export class LogisticsSessionMasterManager {
     this.persist();
     // The card has reached the user: create/update its master row immediately.
     // Capture and semantic tagging update the same row asynchronously afterwards.
-    this.queueBaseSync(masterKey);
+    if (this.config.larkBase) this.queueBaseSync(masterKey);
     this.queue(masterKey);
+  }
+
+  noteTurnCompleted(input: LogisticsSessionTurnCompletedInput): void {
+    if (!this.config.enabled) return;
+    const masterKey = stableLogisticsSessionMasterKey(
+      input.larkAppId,
+      input.sessionId,
+      input.turnId,
+      input.chatId,
+    );
+    const now = this.now();
+    const prior = this.records.get(masterKey);
+    const isNewTurn = !!prior && prior.turnId !== input.turnId;
+    const shouldCapture = !!input.answerMessageId
+      && (isNewTurn || !prior?.transcriptHash || prior.answerMessageId !== input.answerMessageId);
+    const record: LogisticsSessionMasterRecord = {
+      masterKey,
+      larkAppId: input.larkAppId,
+      sessionId: input.sessionId,
+      turnId: input.turnId,
+      surveyId: prior?.surveyId ?? `turn_${input.turnId}`,
+      settledSurveyIds: prior?.settledSurveyIds ?? [],
+      ratingCount: prior?.ratingCount ?? 0,
+      chatId: input.chatId,
+      rootMessageId: input.rootMessageId,
+      respondentOpenId: input.respondentOpenId ?? prior?.respondentOpenId ?? '',
+      title: input.title ?? prior?.title,
+      recap: prior?.recap,
+      answerMessageId: input.answerMessageId ?? prior?.answerMessageId,
+      surveyStatus: prior?.surveyStatus ?? 'scheduled',
+      dueAt: prior?.dueAt ?? now,
+      sentAt: prior?.sentAt,
+      rating: prior?.rating,
+      answeredAt: prior?.answeredAt,
+      ratingState: prior?.ratingState ?? 'awaiting',
+      transcript: shouldCapture ? undefined : prior?.transcript,
+      transcriptHash: shouldCapture ? undefined : prior?.transcriptHash,
+      captureState: shouldCapture ? undefined : prior?.captureState,
+      messages: shouldCapture ? undefined : prior?.messages,
+      taggingState: shouldCapture ? 'pending_capture' : prior?.taggingState ?? 'pending_capture',
+      businessCategory: isNewTurn ? undefined : prior?.businessCategory,
+      problemType: isNewTurn ? undefined : prior?.problemType,
+      resolutionStatus: isNewTurn ? undefined : prior?.resolutionStatus,
+      overallConfidence: isNewTurn ? undefined : prior?.overallConfidence,
+      needsReview: isNewTurn ? false : prior?.needsReview ?? false,
+      reviewReason: isNewTurn ? undefined : prior?.reviewReason,
+      harnessRevision: isNewTurn ? undefined : prior?.harnessRevision,
+      businessReasonCode: isNewTurn ? undefined : prior?.businessReasonCode,
+      problemReasonCode: isNewTurn ? undefined : prior?.problemReasonCode,
+      resolutionReasonCode: isNewTurn ? undefined : prior?.resolutionReasonCode,
+      evidenceAnchors: isNewTurn ? undefined : prior?.evidenceAnchors,
+      manualReviewStatus: prior?.manualReviewStatus ?? 'pending',
+      modelAttempts: isNewTurn ? 0 : prior?.modelAttempts ?? 0,
+      modelError: isNewTurn ? undefined : prior?.modelError,
+      baseRecordId: prior?.baseRecordId,
+      baseSyncError: prior?.baseSyncError,
+      baseSyncAttempts: prior?.baseSyncAttempts ?? 0,
+      createdAt: prior?.createdAt ?? now,
+      updatedAt: now,
+    };
+    this.records.set(masterKey, record);
+    this.persist();
+    if (this.config.larkBase) this.queueBaseSync(masterKey);
+    if (input.answerMessageId) this.queue(masterKey);
   }
 
   noteSurveySettled(survey: FeedbackSurveyRecord): void {
@@ -307,7 +446,7 @@ export class LogisticsSessionMasterManager {
     }
     record.updatedAt = this.now();
     this.persist();
-    this.queueBaseSync(masterKey);
+    if (this.config.larkBase) this.queueBaseSync(masterKey);
   }
 
   private queue(masterKey: string): void {
@@ -338,6 +477,7 @@ export class LogisticsSessionMasterManager {
         live.transcript = snapshot.transcript;
         live.transcriptHash = snapshot.transcriptHash;
         live.captureState = snapshot.captureState;
+        live.messages = snapshot.messages;
         if (snapshot.reviewReason) {
           live.needsReview = true;
           live.reviewReason = mergeReviewReason(live.reviewReason, snapshot.reviewReason);
@@ -345,7 +485,7 @@ export class LogisticsSessionMasterManager {
         live.taggingState = 'tagging';
         live.updatedAt = this.now();
         this.persist();
-        await this.syncBaseBestEffort(masterKey);
+        if (this.config.larkBase) await this.syncBaseBestEffort(masterKey);
       } catch (error) {
         const live = this.records.get(masterKey);
         if (!live) return;
@@ -356,7 +496,7 @@ export class LogisticsSessionMasterManager {
         live.taggingState = 'needs_review';
         live.updatedAt = this.now();
         this.persist();
-        await this.syncBaseBestEffort(masterKey);
+        if (this.config.larkBase) await this.syncBaseBestEffort(masterKey);
         return;
       }
     }
@@ -368,7 +508,7 @@ export class LogisticsSessionMasterManager {
       live.taggingState = 'needs_review';
       live.updatedAt = this.now();
       this.persist();
-      await this.syncBaseBestEffort(masterKey);
+      if (this.config.larkBase) await this.syncBaseBestEffort(masterKey);
       return;
     }
 
@@ -376,14 +516,30 @@ export class LogisticsSessionMasterManager {
       live.modelAttempts += 1;
       live.updatedAt = this.now();
       this.persist();
+      const startedAt = this.now();
       const tagging = await this.options.runModelTask({ record: { ...live } });
       const current = this.records.get(masterKey);
       if (!current) return;
       this.applyTagging(current, tagging);
       current.taggingState = current.needsReview ? 'needs_review' : 'tagged';
+      current.harnessRevision = tagging.harnessRevision;
+      current.businessReasonCode = tagging.businessReasonCode;
+      current.problemReasonCode = tagging.problemReasonCode;
+      current.resolutionReasonCode = tagging.resolutionReasonCode;
+      current.evidenceAnchors = tagging.evidenceAnchors;
+      current.manualReviewStatus = tagging.manualReviewStatus ?? 'pending';
       current.updatedAt = this.now();
+      if (current.transcriptHash) this.conversationStore?.recordLabelRun({
+        masterKey: current.masterKey,
+        transcriptHash: current.transcriptHash,
+        harnessRevision: current.harnessRevision,
+        status: 'completed',
+        attempt: current.modelAttempts,
+        createdAt: startedAt,
+        completedAt: current.updatedAt,
+      });
       this.persist();
-      await this.syncBaseBestEffort(masterKey);
+      if (this.config.larkBase) await this.syncBaseBestEffort(masterKey);
     } catch (error) {
       const current = this.records.get(masterKey);
       if (!current) return;
@@ -392,8 +548,18 @@ export class LogisticsSessionMasterManager {
       this.applyTagging(current, fallbackLogisticsTagging(`模型任务失败：${message}`));
       current.taggingState = 'needs_review';
       current.updatedAt = this.now();
+      if (current.transcriptHash) this.conversationStore?.recordLabelRun({
+        masterKey: current.masterKey,
+        transcriptHash: current.transcriptHash,
+        harnessRevision: current.harnessRevision,
+        status: 'failed',
+        attempt: current.modelAttempts,
+        error: message,
+        createdAt: current.updatedAt,
+        completedAt: current.updatedAt,
+      });
       this.persist();
-      await this.syncBaseBestEffort(masterKey);
+      if (this.config.larkBase) await this.syncBaseBestEffort(masterKey);
     }
   }
 
@@ -404,6 +570,12 @@ export class LogisticsSessionMasterManager {
     record.overallConfidence = tagging.overallConfidence;
     record.needsReview = record.needsReview || tagging.needsReview;
     record.reviewReason = mergeReviewReason(record.reviewReason, tagging.reviewReason);
+    record.harnessRevision = tagging.harnessRevision ?? record.harnessRevision;
+    record.businessReasonCode = tagging.businessReasonCode ?? record.businessReasonCode;
+    record.problemReasonCode = tagging.problemReasonCode ?? record.problemReasonCode;
+    record.resolutionReasonCode = tagging.resolutionReasonCode ?? record.resolutionReasonCode;
+    record.evidenceAnchors = tagging.evidenceAnchors ?? record.evidenceAnchors;
+    record.manualReviewStatus = tagging.manualReviewStatus ?? record.manualReviewStatus ?? 'pending';
   }
 
   private queueBaseSync(masterKey: string): void {
@@ -493,8 +665,15 @@ export class LogisticsSessionMasterManager {
       if (parsed.version !== 1 || !Array.isArray(parsed.records)) return;
       for (const record of parsed.records) {
         if (record.larkAppId === this.options.larkAppId && record.masterKey) {
+          const legacyResolution = String((record as { resolutionStatus?: unknown }).resolutionStatus ?? '');
           this.records.set(record.masterKey, {
             ...record,
+            ...(legacyResolution === 'unresolved' ? {
+              resolutionStatus: 'unknown' as const,
+              needsReview: true,
+              reviewReason: mergeReviewReason(record.reviewReason, '旧未解决状态迁移为 unknown'),
+            } : {}),
+            manualReviewStatus: record.manualReviewStatus ?? 'pending',
             settledSurveyIds: Array.isArray(record.settledSurveyIds) ? record.settledSurveyIds : [],
             ratingCount: Number.isSafeInteger(record.ratingCount) && record.ratingCount >= 0
               ? record.ratingCount
@@ -518,6 +697,16 @@ export class LogisticsSessionMasterManager {
       version: 1,
       records: this.listRecords(),
     } satisfies LogisticsSessionMasterStore), { mode: 0o600, durable: true });
+    for (const record of this.records.values()) {
+      const fingerprint = JSON.stringify(record);
+      if (this.sqliteFingerprints.get(record.masterKey) === fingerprint) continue;
+      try {
+        this.conversationStore?.upsert(record);
+        this.sqliteFingerprints.set(record.masterKey, fingerprint);
+      } catch (error) {
+        logger.warn(`[logistics-session-master] SQLite sync failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
   }
 
   private storePath(): string {
@@ -538,6 +727,7 @@ function toSurveyRecord(record: LogisticsSessionMasterRecord): FeedbackSurveyRec
     chatId: record.chatId,
     rootMessageId: record.rootMessageId,
     respondentOpenId: record.respondentOpenId,
+    title: record.title,
     recap: record.recap,
     answerMessageId: record.answerMessageId,
     status: record.surveyStatus,
@@ -575,6 +765,10 @@ export function startLogisticsSessionMasterManager(
 export function stopLogisticsSessionMasterManager(larkAppId: string): void {
   logisticsSessionMasterManagers.get(larkAppId)?.stop();
   logisticsSessionMasterManagers.delete(larkAppId);
+}
+
+export function noteLogisticsSessionTurnCompleted(input: LogisticsSessionTurnCompletedInput): void {
+  logisticsSessionMasterManagers.get(input.larkAppId)?.noteTurnCompleted(input);
 }
 
 export function noteLogisticsSessionSurveyDispatched(record: FeedbackSurveyRecord): void {

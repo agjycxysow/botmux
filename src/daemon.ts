@@ -53,7 +53,7 @@ import {
 } from './core/supervisor-shutdown-protocol.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, getMessageDetail, listChatMemberOpenIds, listThreadMessages, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatNameAndMode, getMessageChatId, getMessageDetail, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageWithdrawnError, replyMessage, resolveAllowedUsersWithMap, sendMessage, sendUserMessage, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -92,6 +92,7 @@ import {
 import { createFeedbackSurveyBaseUpserter } from './services/feedback-survey-base.js';
 import {
   startLogisticsSessionMasterManager,
+  noteLogisticsSessionTurnCompleted,
   noteLogisticsSessionSurveyDispatched,
   noteLogisticsSessionSurveySettled,
   stopLogisticsSessionMasterManager,
@@ -3380,16 +3381,21 @@ function scheduleFeedbackForCompletedTurn(
     || ds.session.deferredScheduleRun
     || ds.managedTurnOrigin?.dispatchAttempt !== undefined
   ) return;
-  scheduleFeedbackSurveyForTurn({
+  const completed = {
     larkAppId: ds.larkAppId,
     sessionId: ds.session.sessionId,
     turnId,
     chatId: ds.chatId,
     rootMessageId: ds.scope === 'chat' ? null : ds.session.rootMessageId,
-    chatType: ds.chatType,
+    respondentOpenId: ds.session.lastCallerOpenId,
     title: ds.currentTurnTitle ?? ds.session.title,
-    cliId: ds.session.cliId,
     answerMessageId,
+  };
+  noteLogisticsSessionTurnCompleted(completed);
+  scheduleFeedbackSurveyForTurn({
+    ...completed,
+    chatType: ds.chatType,
+    cliId: ds.session.cliId,
   });
 }
 
@@ -21338,7 +21344,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             record.rootMessageId,
             0,
           )
-          : [];
+          : await listChatMessages(record.larkAppId, record.chatId, 200);
         return buildLogisticsSessionSnapshot({
           turnId: record.turnId,
           answerMessageId: record.answerMessageId,
@@ -21364,6 +21370,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         model: cfg.logisticsSessionMaster?.modelTask?.model ?? cfg.model,
         env: cfg.env,
         timeoutMs: cfg.logisticsSessionMaster?.modelTask?.timeoutMs,
+        harnessRoot: cfg.logisticsSessionMaster?.harness?.rootDir,
       }),
     });
   } catch (err) {
