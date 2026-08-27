@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { LogisticsConversationStore } from '../src/services/logistics-conversation-store.js';
+import { buildLogisticsSessionSnapshot } from '../src/services/logistics-session-capture.js';
 import type { LogisticsSessionMasterRecord } from '../src/services/logistics-session-master.js';
 
 const dirs: string[] = [];
@@ -233,6 +234,119 @@ describe('logistics conversation SQLite store', () => {
     store.close();
   });
 
+  it('rebuilds labeling inputs and commits label projections with auditable retries', async () => {
+    const dataDir = await tempDir();
+    const snapshot = buildLogisticsSessionSnapshot({
+      turnId: 'om_turn',
+      answerMessageId: 'om_answer',
+      rootMessageId: 'om_root',
+      sessionStartedAt: '2026-08-20T00:00:00+08:00',
+      messages: [
+        { messageId: 'om_turn', senderType: 'user', content: '问题', createTime: '1000' },
+        { messageId: 'om_answer', senderType: 'app', content: '回答', createTime: '2000' },
+      ],
+    });
+    const store = new LogisticsConversationStore({ dataDir });
+    store.upsert(record({
+      transcript: snapshot.transcript,
+      transcriptHash: snapshot.transcriptHash,
+      captureState: snapshot.captureState,
+      messages: snapshot.messages,
+    }));
+
+    const candidates = store.listLabelingRecords({ larkAppId: 'cli_logistics' });
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({
+      transcriptHash: snapshot.transcriptHash,
+      messages: [
+        { role: 'user', content: '问题' },
+        { role: 'assistant', content: '回答' },
+      ],
+    });
+
+    const revision = 'c'.repeat(64);
+    expect(store.labelRunState(candidates[0]!.masterKey, snapshot.transcriptHash, revision)).toEqual({
+      completed: false,
+      nextAttempt: 1,
+    });
+    store.recordLabelRun({
+      masterKey: candidates[0]!.masterKey,
+      transcriptHash: snapshot.transcriptHash,
+      harnessRevision: revision,
+      status: 'running',
+      model: 'test-model',
+      attempt: 1,
+      createdAt: 10_000,
+    });
+    store.completeLabeling({
+      record: candidates[0]!,
+      tagging: {
+        businessCategory: 'LB01',
+        problemType: 'LP01',
+        resolutionStatus: 'resolved',
+        overallConfidence: 'high',
+        needsReview: false,
+        harnessRevision: revision,
+        businessReasonCode: 'primary_domain_ebill',
+        problemReasonCode: 'rules_or_capability_requested',
+        resolutionReasonCode: 'requested_information_delivered',
+        evidenceAnchors: [
+          { role: 'domain', messageIndex: 0 },
+          { role: 'goal', messageIndex: 0 },
+          { role: 'outcome', messageIndex: 1 },
+        ],
+        manualReviewStatus: 'pending',
+      },
+      harnessRevision: revision,
+      attempt: 1,
+      model: 'test-model',
+      startedAt: 10_000,
+      completedAt: 20_000,
+    });
+
+    expect(store.labelRunState(candidates[0]!.masterKey, snapshot.transcriptHash, revision)).toEqual({
+      completed: true,
+      nextAttempt: 2,
+    });
+    expect(store.detail('conv_21c9e882b55ee6e94b898e21d3ce80d5')).toMatchObject({
+      rating: 5,
+      businessCategory: 'LB01',
+      problemType: 'LP01',
+      resolutionStatus: 'resolved',
+      harnessRevision: revision,
+      needsReview: false,
+    });
+
+    store.failLabeling({
+      masterKey: candidates[0]!.masterKey,
+      transcriptHash: snapshot.transcriptHash,
+      harnessRevision: revision,
+      attempt: 2,
+      model: 'test-model',
+      error: 'transient failure',
+      startedAt: 30_000,
+      completedAt: 40_000,
+    });
+    expect(store.detail('conv_21c9e882b55ee6e94b898e21d3ce80d5')).toMatchObject({
+      businessCategory: 'LB01',
+      resolutionStatus: 'resolved',
+      harnessRevision: revision,
+    });
+    store.close();
+
+    const verified = new DatabaseSync(join(dataDir, 'botmux-conversations.sqlite'), { readOnly: true });
+    expect((verified.prepare(`
+      SELECT status,COUNT(*) count FROM label_runs GROUP BY status ORDER BY status
+    `).all() as Array<{ status: string; count: number }>)).toEqual([
+      { status: 'completed', count: 1 },
+      { status: 'failed', count: 1 },
+    ]);
+    expect((verified.prepare(`
+      SELECT COUNT(*) count FROM conversation_messages
+    `).get() as { count: number }).count).toBe(2);
+    verified.close();
+  });
+
   it('migrates v3 snapshot messages into independent v4 message facts', async () => {
     const dataDir = await tempDir();
     const path = join(dataDir, 'botmux-conversations.sqlite');
@@ -269,9 +383,9 @@ describe('logistics conversation SQLite store', () => {
 
     const migrated = new LogisticsConversationStore({ dataDir });
     expect(migrated.summary()).toMatchObject({
-      conversations: 1,
+      conversations: 0,
       messages: 2,
-      labeled: 1,
+      labeled: 0,
       pendingBackfill: 1,
     });
     expect(migrated.detail('conv_21c9e882b55ee6e94b898e21d3ce80d5')).toMatchObject({
@@ -319,7 +433,7 @@ describe('logistics session catalog coverage', () => {
       pendingBackfill: 2,
       failedBackfill: 0,
       analysisCoverage: 1 / 3,
-      labelCoverage: 1 / 3,
+      labelCoverage: 1,
     });
     expect(store.list({ dataStatus: 'pending' })).toMatchObject({ total: 2 });
     expect(store.list({ dataStatus: 'pending' }).items[0]).not.toHaveProperty('conversationId');

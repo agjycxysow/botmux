@@ -6,6 +6,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { buildOneShotEnv, resolveOneShotCommand } from './session-group-title.js';
+import {
+  sanitizeLogisticsMessageText,
+  sanitizeLogisticsSessionText,
+} from './logistics-session-capture.js';
 import type {
   LogisticsConfidence,
   LogisticsEvidenceAnchor,
@@ -14,6 +18,9 @@ import type {
   LogisticsSessionMasterRecord,
   LogisticsSessionModelTaskRunner,
 } from './logistics-session-master.js';
+
+const HARNESS_MAX_MESSAGES = 200;
+const HARNESS_MAX_MESSAGE_CHARS = 4_000;
 
 export interface LogisticsSessionModelTaskBotConfig {
   cliId: string;
@@ -45,7 +52,7 @@ const defaultExec: LogisticsSessionModelTaskExec = async (file, args, options) =
       maxBuffer: options.maxBuffer,
       encoding: 'utf8',
     }, (error, stdout, stderr) => {
-      if (error && !stdout) {
+      if (error) {
         const detail = String(stderr ?? '').trim().split('\n').slice(-2).join(' ').slice(0, 200);
         reject(new Error(`${error.message.split('\n')[0]}${detail ? ` | stderr: ${detail}` : ''}`));
         return;
@@ -77,6 +84,45 @@ function parseJsonObject(value: string): Record<string, unknown> {
     throw new Error('model_task_output_not_object');
   }
   return parsed as Record<string, unknown>;
+}
+
+function structuredOutputType(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  return typeof value;
+}
+
+function normalizeStructuredOutputSchema(value: unknown): void {
+  if (!value || typeof value !== 'object') return;
+  const node = value as Record<string, unknown>;
+  if (!node.type && Object.hasOwn(node, 'const')) {
+    node.type = structuredOutputType(node.const);
+  }
+  if (!node.type && Array.isArray(node.enum) && node.enum.length) {
+    const types = [...new Set(node.enum.map(structuredOutputType))];
+    if (types.length === 1) node.type = types[0];
+  }
+  for (const child of Object.values(node)) normalizeStructuredOutputSchema(child);
+}
+
+async function prepareStructuredOutputSchema(harnessRoot: string, workDir: string): Promise<string> {
+  const source = join(
+    harnessRoot,
+    '00-Harness',
+    'conversation-labeling',
+    'output-contract.schema.json',
+  );
+  const schema = JSON.parse(await readFile(source, 'utf8')) as Record<string, unknown>;
+  normalizeStructuredOutputSchema(schema);
+  const target = join(workDir, 'structured-output.schema.json');
+  await writeFile(target, `${JSON.stringify(schema, null, 2)}\n`);
+  return target;
+}
+
+function sanitizeLogisticsHarnessMessageText(value: string): string {
+  return sanitizeLogisticsMessageText(value)
+    .replace(/(?:token|cookie|password|secret|api[_-]?key)\s*[:=]\s*[^\s,;，；]*/gi, '[凭据]')
+    .replace(/(?<!\d)\d{8,}(?!\d)/g, '[编号]');
 }
 
 function anchor(value: unknown): LogisticsEvidenceAnchor | undefined {
@@ -182,6 +228,51 @@ export function buildLogisticsHarnessInput(record: LogisticsSessionMasterRecord)
   };
 }
 
+export function prepareLogisticsHarnessRecord(record: LogisticsSessionMasterRecord): {
+  record: LogisticsSessionMasterRecord;
+  truncated: boolean;
+} {
+  let truncated = false;
+  let messages = (record.messages ?? []).flatMap(message => {
+    const chars = Array.from(sanitizeLogisticsHarnessMessageText(message.content));
+    if (!chars.length) return [];
+    if (chars.length <= HARNESS_MAX_MESSAGE_CHARS) {
+      return [{ ...message, content: chars.join('') }];
+    }
+    truncated = true;
+    return [{
+      ...message,
+      content: `${chars.slice(0, HARNESS_MAX_MESSAGE_CHARS - 1).join('')}…`,
+    }];
+  });
+  if (messages.length > HARNESS_MAX_MESSAGES) {
+    truncated = true;
+    const head = Math.floor(HARNESS_MAX_MESSAGES / 2);
+    messages = [...messages.slice(0, head), ...messages.slice(-head)];
+  }
+  const captureState = truncated ? 'partial' as const : record.captureState ?? 'partial';
+  const prepared = { ...record, messages, captureState };
+  const input = buildLogisticsHarnessInput(prepared);
+  const transcript = sanitizeLogisticsSessionText(
+    messages.map(message => `${message.role === 'user' ? '用户' : '助手'}：${message.content}`).join('\n'),
+  );
+  return {
+    record: {
+      ...prepared,
+      transcript,
+      transcriptHash: String(input.transcript_hash),
+    },
+    truncated,
+  };
+}
+
+export function isLogisticsHarnessRecordAnalyzable(
+  record: LogisticsSessionMasterRecord,
+): boolean {
+  return record.messages?.some(message => message.role === 'user' && !!message.content.trim())
+    ?? false;
+}
+
 export function buildLogisticsModelTaskPrompt(
   record: LogisticsSessionMasterRecord,
   harnessRoot?: string,
@@ -191,6 +282,7 @@ export function buildLogisticsModelTaskPrompt(
     return [
       '执行当前工作区 `.agents/skills/logistics-conversation-labeler/SKILL.md`。',
       '输入文件由调用方提供；只读取该冻结 JSON，不扩大历史范围，不调用任何写接口。',
+      '在当前这一次响应内直接完成打标；不要只回复计划、确认或进度。',
       '最终只输出一个符合 Harness output contract 的 JSON 对象，不输出 Markdown。',
       `冻结输入：${inputPath ?? '（未提供）'}`,
     ].join('\n');
@@ -243,6 +335,64 @@ function validateHarness(harnessRoot: string, inputPath: string, outputPath: str
   }
 }
 
+function validateHarnessInput(harnessRoot: string, inputPath: string): void {
+  const validator = join(
+    harnessRoot,
+    '.agents',
+    'skills',
+    'logistics-conversation-labeler',
+    'scripts',
+    'validate_labeling.py',
+  );
+  if (!existsSync(validator)) throw new Error(`harness_validator_missing:${validator}`);
+  const script = [
+    'import importlib.util, json, sys',
+    'from pathlib import Path',
+    'spec = importlib.util.spec_from_file_location("label_validator", sys.argv[1])',
+    'module = importlib.util.module_from_spec(spec)',
+    'spec.loader.exec_module(module)',
+    'try:',
+    '    value = module.load_json(Path(sys.argv[2]))',
+    '    messages = module.validate_input(value)',
+    '    hits = []',
+    '    for index, message in enumerate(messages):',
+    '        names = module.sensitive_hits(message["content"])',
+    '        if names:',
+    '            hits.append(str(index) + ":" + ",".join(names))',
+    '    if hits:',
+    '        raise ValueError("input_not_sanitized:" + ";".join(hits))',
+    'except ValueError as exc:',
+    '    print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))',
+    '    raise SystemExit(1)',
+    'print(json.dumps({"ok": True}, ensure_ascii=False))',
+  ].join('\n');
+  const result = spawnSync('python3', ['-c', script, validator, inputPath], {
+    cwd: harnessRoot,
+    encoding: 'utf8',
+    timeout: 30_000,
+  });
+  if (result.status !== 0) {
+    const detail = String(result.stdout || result.stderr || '').trim().slice(0, 500);
+    throw new Error(`harness_input_validation_failed:${detail}`);
+  }
+}
+
+export function resolveLogisticsHarnessRevision(harnessRoot: string): string {
+  const validator = join(harnessRoot, '.agents', 'skills', 'logistics-conversation-labeler', 'scripts', 'validate_labeling.py');
+  if (!existsSync(validator)) throw new Error(`harness_validator_missing:${validator}`);
+  const result = spawnSync('python3', [validator, '--print-revision'], {
+    cwd: harnessRoot,
+    encoding: 'utf8',
+    timeout: 30_000,
+  });
+  const revision = String(result.stdout ?? '').trim();
+  if (result.status !== 0 || !/^[a-f0-9]{64}$/.test(revision)) {
+    const detail = String(result.stderr || result.stdout || '').trim().slice(0, 500);
+    throw new Error(`harness_revision_failed:${detail || result.status}`);
+  }
+  return revision;
+}
+
 export function createLogisticsSessionModelTaskRunner(
   bot: LogisticsSessionModelTaskBotConfig,
   exec: LogisticsSessionModelTaskExec = defaultExec,
@@ -257,17 +407,25 @@ export function createLogisticsSessionModelTaskRunner(
     const harnessRoot = harnessSource ? await prepareHarnessWorkspace(harnessSource, workDir) : undefined;
     const inputPath = harnessRoot ? join(workDir, 'input.json') : undefined;
     try {
-      if (inputPath) await writeFile(inputPath, JSON.stringify(buildLogisticsHarnessInput(record), null, 2));
+      if (harnessRoot && inputPath) {
+        await writeFile(inputPath, JSON.stringify(buildLogisticsHarnessInput(record), null, 2));
+        validateHarnessInput(harnessRoot, inputPath);
+      }
       const template = bot.cliId === 'traex'
         ? ['traex', 'exec', '--skip-git-repo-check']
         : ['codex', 'exec', '--skip-git-repo-check'];
       const { argv, env: wrapperEnv } = resolveOneShotCommand(bot, template);
       const prompt = buildLogisticsModelTaskPrompt(record, harnessRoot, inputPath);
+      const outputSchemaPath = harnessRoot
+        ? await prepareStructuredOutputSchema(harnessRoot, workDir)
+        : undefined;
       await exec(argv[0], [
         ...argv.slice(1),
+        ...(bot.model ? ['--model', bot.model] : []),
         '--ephemeral',
         '--sandbox',
         'read-only',
+        ...(outputSchemaPath ? ['--output-schema', outputSchemaPath] : []),
         '--output-last-message',
         outputPath,
         prompt,

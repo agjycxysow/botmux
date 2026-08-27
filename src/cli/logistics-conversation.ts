@@ -17,6 +17,12 @@ import {
   stableLogisticsSessionMasterKey,
   type LogisticsSessionMasterRecord,
 } from '../services/logistics-session-master.js';
+import {
+  createLogisticsSessionModelTaskRunner,
+  isLogisticsHarnessRecordAnalyzable,
+  prepareLogisticsHarnessRecord,
+  resolveLogisticsHarnessRevision,
+} from '../services/logistics-session-model-task.js';
 import { loadAllSessionsSnapshot } from '../services/session-store.js';
 import type { Session } from '../types.js';
 
@@ -30,17 +36,33 @@ interface BackfillOptions {
   cursor?: string;
 }
 
+interface LabelOptions {
+  apply: boolean;
+  force: boolean;
+  bot?: string;
+  session?: string;
+  limit: number;
+  concurrency: number;
+  cursor?: string;
+  harnessRoot?: string;
+  model?: string;
+}
+
 function usage(message?: string): never {
   if (message) console.error(message);
   console.error(`Usage:
   botmux logistics sync-catalog [--bot <appId>]
   botmux logistics backfill [--bot <appId>] [--session <id-prefix>] [--since <ISO|YYYY-MM-DD>] [--until <ISO|YYYY-MM-DD>] [--limit N] [--cursor <opaque>] [--apply]
+  botmux logistics label [--bot <appId>] [--session <id-prefix>] [--limit N] [--cursor <opaque>] [--concurrency N] [--harness-root <dir>] [--model <id>] [--force] [--apply]
   botmux logistics import-legacy [--bot <appId>]
   botmux logistics import-surveys [--bot <appId>]
 
 backfill defaults to dry-run. It reads bounded BotMux session metadata; --apply fetches
 visible Lark history and writes sanitized message facts plus bounded snapshots to SQLite.
-It never runs semantic labeling.`);
+It never runs semantic labeling.
+
+label defaults to dry-run. It reads only captured SQLite snapshots and invokes the
+configured read-only Labeling Harness when --apply is present.`);
   process.exit(2);
 }
 
@@ -84,6 +106,38 @@ function parseBackfill(args: string[]): BackfillOptions {
     until: dateArg(value(args, '--until'), true),
     limit,
     cursor: value(args, '--cursor'),
+  };
+}
+
+function parseLabel(args: string[]): LabelOptions {
+  const knownWithValue = new Set([
+    '--bot', '--session', '--limit', '--cursor', '--concurrency', '--harness-root', '--model',
+  ]);
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i]!;
+    if (arg === '--apply' || arg === '--force') continue;
+    const flag = arg.includes('=') ? arg.slice(0, arg.indexOf('=')) : arg;
+    if (!knownWithValue.has(flag)) usage(`Unknown option: ${arg}`);
+    if (!arg.includes('=')) i += 1;
+  }
+  const limitRaw = value(args, '--limit');
+  const limit = limitRaw ? Number(limitRaw) : 50;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) usage('--limit must be 1..500');
+  const concurrencyRaw = value(args, '--concurrency');
+  const concurrency = concurrencyRaw ? Number(concurrencyRaw) : 2;
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 8) {
+    usage('--concurrency must be 1..8');
+  }
+  return {
+    apply: args.includes('--apply'),
+    force: args.includes('--force'),
+    bot: value(args, '--bot'),
+    session: value(args, '--session'),
+    limit,
+    concurrency,
+    cursor: value(args, '--cursor'),
+    harnessRoot: value(args, '--harness-root'),
+    model: value(args, '--model'),
   };
 }
 
@@ -140,6 +194,12 @@ interface LogisticsBackfillCursor {
   filter: string;
 }
 
+interface LogisticsLabelCursor {
+  v: 1;
+  masterKey: string;
+  filter: string;
+}
+
 function filterFingerprint(options: BackfillOptions): string {
   return JSON.stringify({
     bot: options.bot ?? '', session: options.session ?? '',
@@ -164,6 +224,77 @@ function encodeCursor(session: Session, options: BackfillOptions): string {
     v: 1, at: sessionTime(session), sessionId: session.sessionId, filter: filterFingerprint(options),
   };
   return Buffer.from(JSON.stringify(payload)).toString('base64url');
+}
+
+function labelFilterFingerprint(options: LabelOptions, harnessRevision: string): string {
+  return JSON.stringify({
+    bot: options.bot ?? '',
+    session: options.session ?? '',
+    force: options.force,
+    harnessRevision,
+  });
+}
+
+function decodeLabelCursor(
+  raw: string | undefined,
+  options: LabelOptions,
+  harnessRevision: string,
+): LogisticsLabelCursor | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as LogisticsLabelCursor;
+    if (parsed.v !== 1 || typeof parsed.masterKey !== 'string') throw new Error('shape');
+    if (parsed.filter !== labelFilterFingerprint(options, harnessRevision)) throw new Error('filter');
+    return parsed;
+  } catch {
+    throw new Error('invalid_label_cursor');
+  }
+}
+
+function encodeLabelCursor(
+  masterKey: string,
+  options: LabelOptions,
+  harnessRevision: string,
+): string {
+  const payload: LogisticsLabelCursor = {
+    v: 1,
+    masterKey,
+    filter: labelFilterFingerprint(options, harnessRevision),
+  };
+  return Buffer.from(JSON.stringify(payload)).toString('base64url');
+}
+
+export interface LogisticsLabelCandidate {
+  record: LogisticsSessionMasterRecord;
+  attempt: number;
+  truncated: boolean;
+}
+
+export function paginateLogisticsLabelCandidates(
+  candidates: LogisticsLabelCandidate[],
+  options: LabelOptions,
+  harnessRevision: string,
+): {
+  candidates: LogisticsLabelCandidate[];
+  totalCandidates: number;
+  hasMore: boolean;
+  nextCursor?: string;
+} {
+  const cursor = decodeLabelCursor(options.cursor, options, harnessRevision);
+  const sorted = [...candidates].sort((left, right) => left.record.masterKey.localeCompare(right.record.masterKey));
+  const remaining = cursor
+    ? sorted.filter(candidate => candidate.record.masterKey.localeCompare(cursor.masterKey) > 0)
+    : sorted;
+  const page = remaining.slice(0, options.limit);
+  const hasMore = remaining.length > page.length;
+  return {
+    candidates: page,
+    totalCandidates: sorted.length,
+    hasMore,
+    ...(hasMore && page.length
+      ? { nextCursor: encodeLabelCursor(page.at(-1)!.record.masterKey, options, harnessRevision) }
+      : {}),
+  };
 }
 
 export function paginateLogisticsBackfillSessions(
@@ -581,6 +712,187 @@ async function backfill(dataDir: string, args: string[]): Promise<void> {
   console.log(JSON.stringify(result, null, 2));
 }
 
+async function label(dataDir: string, args: string[]): Promise<void> {
+  const options = parseLabel(args);
+  const configs = loadBotConfigs();
+  const bot = selectBot(configs, options.bot);
+  registerBot(bot);
+  const harnessRoot = options.harnessRoot
+    ?? bot.logisticsSessionMaster?.harness?.rootDir
+    ?? process.env.LOGISTICS_CONVERSATION_HARNESS_ROOT;
+  if (!harnessRoot) throw new Error('logistics_label_harness_root_required');
+  const harnessRevision = resolveLogisticsHarnessRevision(harnessRoot);
+  const model = options.model
+    ?? bot.logisticsSessionMaster?.modelTask?.model
+    ?? bot.model;
+  const store = new LogisticsConversationStore({
+    dataDir,
+    path: bot.logisticsSessionMaster?.sqlite?.path,
+  });
+  try {
+    const records = store.listLabelingRecords({
+      larkAppId: bot.larkAppId,
+      sessionPrefix: options.session,
+    });
+    const skippedCompleted = { count: 0 };
+    const ineligibleNoUser = { count: 0 };
+    const eligible = records.flatMap(record => {
+      const prepared = prepareLogisticsHarnessRecord(record);
+      if (!isLogisticsHarnessRecordAnalyzable(prepared.record)) {
+        ineligibleNoUser.count += 1;
+        return [];
+      }
+      const state = store.labelRunState(
+        prepared.record.masterKey,
+        prepared.record.transcriptHash!,
+        harnessRevision,
+      );
+      if (state.completed && !options.force) {
+        skippedCompleted.count += 1;
+        return [];
+      }
+      return [{
+        record: prepared.record,
+        attempt: state.nextAttempt,
+        truncated: prepared.truncated,
+      }];
+    });
+    const page = paginateLogisticsLabelCandidates(eligible, options, harnessRevision);
+    if (!options.apply) {
+      console.log(JSON.stringify({
+        mode: 'dry-run',
+        harnessRevision,
+        model: model ?? null,
+        totalCaptured: records.length,
+        totalEligible: records.length - ineligibleNoUser.count,
+        totalCandidates: page.totalCandidates,
+        skippedCompleted: skippedCompleted.count,
+        ineligibleNoUser: ineligibleNoUser.count,
+        candidateCount: page.candidates.length,
+        partialInputs: page.candidates.filter(candidate => candidate.record.captureState === 'partial').length,
+        hasMore: page.hasMore,
+        nextCursor: page.nextCursor ?? null,
+        candidates: page.candidates.map(candidate => ({
+          session: candidate.record.sessionId.slice(0, 12),
+          messages: candidate.record.messages?.length ?? 0,
+          captureState: candidate.record.captureState,
+          attempt: candidate.attempt,
+        })),
+      }, null, 2));
+      return;
+    }
+
+    const runner = createLogisticsSessionModelTaskRunner({
+      cliId: bot.cliId,
+      cliPathOverride: bot.cliPathOverride,
+      wrapperCli: bot.wrapperCli,
+      model,
+      env: bot.env,
+      timeoutMs: bot.logisticsSessionMaster?.modelTask?.timeoutMs,
+      harnessRoot,
+    });
+    const result = {
+      mode: 'apply',
+      harnessRevision,
+      model: model ?? null,
+      totalCaptured: records.length,
+      totalEligible: records.length - ineligibleNoUser.count,
+      candidates: page.candidates.length,
+      totalCandidates: page.totalCandidates,
+      skippedCompleted: skippedCompleted.count,
+      ineligibleNoUser: ineligibleNoUser.count,
+      partialInputs: page.candidates.filter(candidate => candidate.record.captureState === 'partial').length,
+      hasMore: page.hasMore,
+      nextCursor: page.nextCursor ?? null,
+      labeled: 0,
+      failed: 0,
+      distributions: {
+        business: {} as Record<string, number>,
+        problem: {} as Record<string, number>,
+        resolution: {} as Record<string, number>,
+        review: {} as Record<string, number>,
+      },
+      failures: [] as Array<{ session: string; reason: string }>,
+    };
+    let nextIndex = 0;
+    let finished = 0;
+    const worker = async () => {
+      while (true) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const candidate = page.candidates[index];
+        if (!candidate) return;
+        const startedAt = Date.now();
+        store.recordLabelRun({
+          masterKey: candidate.record.masterKey,
+          transcriptHash: candidate.record.transcriptHash!,
+          harnessRevision,
+          status: 'running',
+          model,
+          attempt: candidate.attempt,
+          createdAt: startedAt,
+        });
+        try {
+          const tagging = await runner({ record: candidate.record });
+          if (tagging.harnessRevision !== harnessRevision) {
+            throw new Error(`harness_revision_mismatch:${tagging.harnessRevision ?? 'missing'}`);
+          }
+          const completedAt = Date.now();
+          store.completeLabeling({
+            record: candidate.record,
+            tagging,
+            harnessRevision,
+            attempt: candidate.attempt,
+            model,
+            startedAt,
+            completedAt,
+          });
+          result.labeled += 1;
+          result.distributions.business[tagging.businessCategory]
+            = (result.distributions.business[tagging.businessCategory] ?? 0) + 1;
+          result.distributions.problem[tagging.problemType]
+            = (result.distributions.problem[tagging.problemType] ?? 0) + 1;
+          result.distributions.resolution[tagging.resolutionStatus]
+            = (result.distributions.resolution[tagging.resolutionStatus] ?? 0) + 1;
+          const review = tagging.needsReview ? 'needs_review' : 'auto_labeled';
+          result.distributions.review[review] = (result.distributions.review[review] ?? 0) + 1;
+        } catch (error) {
+          const reason = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
+          store.failLabeling({
+            masterKey: candidate.record.masterKey,
+            transcriptHash: candidate.record.transcriptHash!,
+            harnessRevision,
+            attempt: candidate.attempt,
+            model,
+            error: reason,
+            startedAt,
+            completedAt: Date.now(),
+          });
+          result.failed += 1;
+          if (result.failures.length < 50) result.failures.push({
+            session: candidate.record.sessionId.slice(0, 12),
+            reason,
+          });
+        } finally {
+          finished += 1;
+          if (finished === page.candidates.length || finished % 10 === 0 || result.failed > 0) {
+            console.error(`[logistics label] ${finished}/${page.candidates.length} labeled=${result.labeled} failed=${result.failed}`);
+          }
+        }
+      }
+    };
+    await Promise.all(
+      Array.from(
+        { length: Math.min(options.concurrency, Math.max(1, page.candidates.length)) },
+        () => worker(),
+      ),
+    );
+    console.log(JSON.stringify(result, null, 2));
+  } finally {
+    store.close();
+  }
+}
+
 function syncCatalog(dataDir: string, args: string[]): void {
   const bot = value(args, '--bot');
   const unknown = args.filter((arg, index) => arg !== '--bot' && args[index - 1] !== '--bot' && !arg.startsWith('--bot='));
@@ -619,6 +931,7 @@ function importLegacy(dataDir: string, args: string[]): void {
 export async function runLogisticsConversationCommand(sub: string, args: string[], dataDir: string): Promise<void> {
   if (sub === 'sync-catalog') return syncCatalog(dataDir, args);
   if (sub === 'backfill') return backfill(dataDir, args);
+  if (sub === 'label') return label(dataDir, args);
   if (sub === 'import-legacy') return importLegacy(dataDir, args);
   if (sub === 'import-surveys') return importSurveys(dataDir, args);
   usage();

@@ -19,7 +19,7 @@ afterEach(async () => {
   await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })));
 });
 
-function record(): LogisticsSessionMasterRecord {
+function record(overrides: Partial<LogisticsSessionMasterRecord> = {}): LogisticsSessionMasterRecord {
   return {
     masterKey: 'oc_chat:session-1', larkAppId: 'cli_logistics', sessionId: 'session-1',
     turnId: 'om_turn', surveyId: 'survey-1', settledSurveyIds: [], ratingCount: 0,
@@ -29,7 +29,9 @@ function record(): LogisticsSessionMasterRecord {
     messages: [{ role: 'user', content: '问' }, { role: 'assistant', content: '答' }],
     taggingState: 'tagged', businessCategory: 'LB02', problemType: 'LP01',
     resolutionStatus: 'resolved', overallConfidence: 'high', needsReview: false,
+    harnessRevision: 'c'.repeat(64),
     modelAttempts: 1, baseSyncAttempts: 0, createdAt: 1_000, updatedAt: 2_000,
+    ...overrides,
   };
 }
 
@@ -48,6 +50,21 @@ describe('standalone logistics analytics server', () => {
       },
     ]);
     store.upsert(record());
+    store.upsert(record({
+      masterKey: 'oc_chat_3:session-3',
+      sessionId: 'session-3',
+      turnId: 'om_turn_3',
+      surveyId: 'survey-3',
+      chatId: 'oc_chat_3',
+      rootMessageId: 'om_root_3',
+      title: '仅助手消息',
+      transcript: '助手：历史回复',
+      transcriptHash: 'b'.repeat(64),
+      messages: [{ role: 'assistant', content: '历史回复' }],
+      businessCategory: 'LB99',
+      problemType: 'LP99',
+      updatedAt: 5_000,
+    }));
     store.close();
 
     const server = createLogisticsAnalyticsServer({ dataDir, accessToken: 'secret' });
@@ -61,12 +78,19 @@ describe('standalone logistics analytics server', () => {
     try {
       expect((await fetch(`${base}/api/overview`)).status).toBe(401);
       const headers = { authorization: 'Bearer secret' };
+      expect((await fetch(`${base}/favicon.ico`, { headers })).status).toBe(204);
       const overview = await fetch(`${base}/api/overview`, { headers });
       expect(overview.status).toBe(200);
       await expect(overview.json()).resolves.toMatchObject({
-        totalSessions: 2, conversations: 1, labeled: 1, pendingBackfill: 1,
+        totalSessions: 3, conversations: 1, labeled: 1, pendingBackfill: 1,
         surveyRecords: 0, answeredSurveys: 0,
-        analysisCoverage: 0.5, labelCoverage: 0.5, resolved: 1,
+        analysisCoverage: 1 / 3, labelCoverage: 1, resolved: 1,
+      });
+      const distributions = await fetch(`${base}/api/distributions`, { headers });
+      await expect(distributions.json()).resolves.toMatchObject({
+        business: [{ key: 'LB02', count: 1 }],
+        problem: [{ key: 'LP01', count: 1 }],
+        resolution: [{ key: 'resolved', count: 1 }],
       });
       const pending = await fetch(`${base}/api/sessions?dataStatus=pending`, { headers });
       await expect(pending.json()).resolves.toMatchObject({
@@ -77,6 +101,7 @@ describe('standalone logistics analytics server', () => {
       expect(page.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
       const pageText = await page.text();
       expect(pageText).toContain('物流专家 · 数据概览');
+      expect(pageText).toContain('已解决问题');
       expect(pageText).toContain('分析覆盖率');
       expect(pageText).toContain('全部数据状态');
       expect(pageText).toContain('已采集');

@@ -7,7 +7,9 @@ import {
   logisticsSessionCatalogInput,
   mergeLogisticsAnswerPreview,
   paginateLogisticsBackfillSessions,
+  paginateLogisticsLabelCandidates,
 } from '../src/cli/logistics-conversation.js';
+import type { LogisticsSessionMasterRecord } from '../src/services/logistics-session-master.js';
 import type { Session } from '../src/types.js';
 
 describe('logistics conversation history boundary inference', () => {
@@ -94,6 +96,80 @@ describe('logistics backfill cursor pagination', () => {
     expect(logisticsSessionCatalogInput(session(1))).toMatchObject({
       larkAppId: 'cli_logistics', sessionId: 'session-0001', scope: 'thread', sessionStatus: 'active',
     });
+  });
+});
+
+function labelCandidate(index: number) {
+  const record: LogisticsSessionMasterRecord = {
+    masterKey: `oc_chat:session-${String(index).padStart(4, '0')}`,
+    larkAppId: 'cli_logistics',
+    sessionId: `session-${String(index).padStart(4, '0')}`,
+    turnId: `om_turn_${index}`,
+    surveyId: `survey-${index}`,
+    settledSurveyIds: [],
+    ratingCount: 0,
+    chatId: 'oc_chat',
+    rootMessageId: `om_root_${index}`,
+    respondentOpenId: '',
+    surveyStatus: 'scheduled',
+    dueAt: index,
+    ratingState: 'awaiting',
+    transcript: `用户：问题 ${index}`,
+    transcriptHash: String(index).padStart(64, '0'),
+    captureState: 'complete',
+    messages: [{ role: 'user', content: `问题 ${index}` }],
+    taggingState: 'needs_review',
+    needsReview: false,
+    modelAttempts: 0,
+    baseSyncAttempts: 0,
+    createdAt: index,
+    updatedAt: index,
+  };
+  return { record, attempt: 1, truncated: false };
+}
+
+describe('logistics label cursor pagination', () => {
+  const revision = 'a'.repeat(64);
+  const options = {
+    apply: false,
+    force: false,
+    bot: 'cli_logistics',
+    limit: 2,
+    concurrency: 1,
+  };
+
+  it('walks the stable master-key order without duplicate model candidates', () => {
+    const candidates = [labelCandidate(3), labelCandidate(1), labelCandidate(2)];
+    const first = paginateLogisticsLabelCandidates(candidates, options, revision);
+    expect(first.candidates.map(candidate => candidate.record.sessionId)).toEqual([
+      'session-0001',
+      'session-0002',
+    ]);
+    expect(first.hasMore).toBe(true);
+    const second = paginateLogisticsLabelCandidates(candidates, {
+      ...options,
+      cursor: first.nextCursor,
+    }, revision);
+    expect(second.candidates.map(candidate => candidate.record.sessionId)).toEqual(['session-0003']);
+    expect(second.hasMore).toBe(false);
+  });
+
+  it('fails closed when the label filter or Harness revision changes', () => {
+    const first = paginateLogisticsLabelCandidates([labelCandidate(1), labelCandidate(2)], {
+      ...options,
+      limit: 1,
+    }, revision);
+    expect(() => paginateLogisticsLabelCandidates([labelCandidate(1), labelCandidate(2)], {
+      ...options,
+      force: true,
+      limit: 1,
+      cursor: first.nextCursor,
+    }, revision)).toThrow('invalid_label_cursor');
+    expect(() => paginateLogisticsLabelCandidates([labelCandidate(1), labelCandidate(2)], {
+      ...options,
+      limit: 1,
+      cursor: first.nextCursor,
+    }, 'b'.repeat(64))).toThrow('invalid_label_cursor');
   });
 });
 

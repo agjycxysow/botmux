@@ -55,6 +55,37 @@ and platform message ID. Missing turn/final boundaries do not discard messages:
 the facts remain stored and the catalog records `missing_turn` or
 `missing_answer`.
 
+`botmux logistics label` is an independent, SQLite-only semantic labeling
+command and is also dry-run by default. It requires the order-delivery Harness
+root and never fetches Lark history or writes Lark Base. Candidates are frozen
+from `captured` conversations, rebuilt from message facts, and rejected if the
+reconstructed snapshot hash differs from the captured snapshot.
+
+```text
+botmux logistics label \
+  --bot <appId> \
+  --harness-root /path/to/order-delivery-codex-workspace \
+  --limit 50 \
+  --concurrency 2 \
+  --apply
+```
+
+Each model attempt is recorded in `label_runs`. A completed run for the same
+frozen input hash and Harness revision is skipped on later executions; failed
+runs remain retryable. `--force` explicitly creates another attempt. Validated
+outputs update the current conversation projection and append the revisioned
+label fact in one transaction without changing message facts, surveys, ratings,
+or catalog capture status.
+
+Captured records without any user message remain available as message facts but
+are reported as `ineligibleNoUser` and excluded from semantic labeling and
+resolution-rate denominators because the Harness requires user-goal evidence.
+
+The Harness accepts at most 200 messages and 4,000 characters per message.
+Oversized inputs retain deterministic head/tail context, are marked `partial`,
+and therefore fall back to review-required labels under the Harness contract
+instead of being silently treated as complete.
+
 The analytics server binds to loopback by default. A non-loopback bind is refused
 unless `BOTMUX_ANALYTICS_TOKEN` is set. For first login, `/overview?t=<token>`
 exchanges the query value for an HttpOnly cookie and redirects to the clean URL.

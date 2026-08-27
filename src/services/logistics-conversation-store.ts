@@ -5,8 +5,10 @@ import { dirname, join, resolve } from 'node:path';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 
 import type { FeedbackSurveyRecord } from './feedback-survey.js';
+import { buildLogisticsSessionSnapshot } from './logistics-session-capture.js';
 import type {
   LogisticsEvidenceAnchor,
+  LogisticsModelTagging,
   LogisticsSessionMasterRecord,
 } from './logistics-session-master.js';
 
@@ -47,6 +49,11 @@ export interface LogisticsCapturedMessageWriteResult {
   total: number;
   inserted: number;
   updated: number;
+}
+
+export interface LogisticsLabelRunState {
+  completed: boolean;
+  nextAttempt: number;
 }
 
 export interface LogisticsSessionCatalogInput {
@@ -208,6 +215,19 @@ function where(filters: LogisticsConversationFilters, conversationAlias = 'c', c
     params.push(filters.needsReview ? 1 : 0);
   }
   return { sql: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '', params };
+}
+
+function analyzableConversationCondition(
+  conversationAlias = 'c',
+  catalogAlias = 'sc',
+): string {
+  return `${conversationAlias}.master_key IS NOT NULL
+    AND ${catalogAlias}.backfill_status='captured'
+    AND ${conversationAlias}.transcript LIKE '%用户：%'`;
+}
+
+function appendWhereCondition(sql: string, condition: string): string {
+  return sql ? `${sql} AND ${condition}` : `WHERE ${condition}`;
 }
 
 function sessionPublicId(larkAppId: string, sessionId: string): string {
@@ -836,7 +856,247 @@ export class LogisticsConversationStore {
     }
   }
 
+  listLabelingRecords(filters: { larkAppId?: string; sessionPrefix?: string } = {}): LogisticsSessionMasterRecord[] {
+    const rows = this.db.prepare(`
+      SELECT c.*,sc.scope,sc.created_at session_created_at
+      FROM conversations c
+      JOIN session_catalog sc ON sc.lark_app_id=c.lark_app_id AND sc.session_id=c.session_id
+      WHERE sc.backfill_status='captured'
+        AND c.transcript_hash IS NOT NULL
+        AND (? IS NULL OR c.lark_app_id=?)
+      ORDER BY c.master_key
+    `).all(filters.larkAppId ?? null, filters.larkAppId ?? null) as any[];
+    const messagesFor = this.db.prepare(`
+      SELECT platform_message_id,role,content,occurred_at
+      FROM conversation_messages
+      WHERE session_key=?
+      ORDER BY occurred_at IS NULL,occurred_at,message_id
+    `);
+    return rows
+      .filter(row => !filters.sessionPrefix || String(row.session_id).startsWith(filters.sessionPrefix))
+      .map(row => {
+        const sessionKey = `${row.lark_app_id}:${row.session_id}`;
+        const messages = (messagesFor.all(sessionKey) as any[]).map(message => ({
+          messageId: String(message.platform_message_id ?? ''),
+          senderType: message.role === 'user' ? 'user' : 'app',
+          content: String(message.content),
+          ...(message.occurred_at === null || message.occurred_at === undefined
+            ? {}
+            : { createTime: String(message.occurred_at) }),
+        }));
+        const snapshot = buildLogisticsSessionSnapshot({
+          turnId: String(row.turn_id),
+          ...(row.answer_message_id ? { answerMessageId: String(row.answer_message_id) } : {}),
+          rootMessageId: row.scope === 'chat' ? null : String(row.root_message_id ?? ''),
+          sessionStartedAt: new Date(Number(row.session_created_at)).toISOString(),
+          messages,
+        });
+        if (snapshot.transcriptHash !== row.transcript_hash) {
+          throw new Error(`label_snapshot_hash_mismatch:${row.public_id}`);
+        }
+        return {
+          masterKey: String(row.master_key),
+          larkAppId: String(row.lark_app_id),
+          sessionId: String(row.session_id),
+          turnId: String(row.turn_id),
+          surveyId: String(row.survey_id ?? `turn_${row.turn_id}`),
+          settledSurveyIds: [],
+          ratingCount: Number(row.rating_count ?? 0),
+          chatId: String(row.chat_id),
+          rootMessageId: row.root_message_id ? String(row.root_message_id) : null,
+          respondentOpenId: '',
+          ...(row.title ? { title: String(row.title) } : {}),
+          ...(row.recap ? { recap: String(row.recap) } : {}),
+          ...(row.answer_message_id ? { answerMessageId: String(row.answer_message_id) } : {}),
+          surveyStatus: String(row.survey_status ?? 'scheduled') as FeedbackSurveyRecord['status'],
+          dueAt: Number(row.updated_at),
+          ...(row.rating !== null && row.rating !== undefined ? { rating: Number(row.rating) } : {}),
+          ratingState: String(row.rating_state ?? 'awaiting') as LogisticsSessionMasterRecord['ratingState'],
+          transcript: snapshot.transcript,
+          transcriptHash: snapshot.transcriptHash,
+          captureState: snapshot.captureState,
+          messages: snapshot.messages,
+          taggingState: String(row.tagging_state ?? 'needs_review') as LogisticsSessionMasterRecord['taggingState'],
+          ...(row.business_category ? { businessCategory: String(row.business_category) } : {}),
+          ...(row.problem_type ? { problemType: String(row.problem_type) } : {}),
+          ...(row.resolution_status ? { resolutionStatus: String(row.resolution_status) as LogisticsSessionMasterRecord['resolutionStatus'] } : {}),
+          ...(row.overall_confidence ? { overallConfidence: String(row.overall_confidence) as LogisticsSessionMasterRecord['overallConfidence'] } : {}),
+          needsReview: bool(row.needs_review),
+          ...(row.review_reason ? { reviewReason: String(row.review_reason) } : {}),
+          ...(row.harness_revision ? { harnessRevision: String(row.harness_revision) } : {}),
+          ...(row.business_reason_code ? { businessReasonCode: String(row.business_reason_code) } : {}),
+          ...(row.problem_reason_code ? { problemReasonCode: String(row.problem_reason_code) } : {}),
+          ...(row.resolution_reason_code ? { resolutionReasonCode: String(row.resolution_reason_code) } : {}),
+          evidenceAnchors: parseJson<LogisticsEvidenceAnchor[]>(row.evidence_anchors_json, []),
+          manualReviewStatus: 'pending',
+          modelAttempts: Number(row.model_attempts ?? 0),
+          ...(row.model_error ? { modelError: String(row.model_error) } : {}),
+          baseSyncAttempts: 0,
+          createdAt: Number(row.session_created_at),
+          updatedAt: Number(row.updated_at),
+        };
+      });
+  }
+
+  labelRunState(masterKey: string, transcriptHash: string, harnessRevision: string): LogisticsLabelRunState {
+    const row = this.db.prepare(`
+      SELECT COALESCE(MAX(attempt),0) max_attempt,
+        COALESCE(SUM(status='completed'),0) completed
+      FROM label_runs
+      WHERE master_key=? AND transcript_hash=? AND harness_revision=?
+    `).get(masterKey, transcriptHash, harnessRevision) as any;
+    return {
+      completed: Number(row?.completed ?? 0) > 0,
+      nextAttempt: Number(row?.max_attempt ?? 0) + 1,
+    };
+  }
+
+  completeLabeling(input: {
+    record: LogisticsSessionMasterRecord;
+    tagging: LogisticsModelTagging;
+    harnessRevision: string;
+    attempt: number;
+    model?: string;
+    startedAt: number;
+    completedAt: number;
+  }): void {
+    const { record, tagging } = input;
+    if (!record.transcript || !record.transcriptHash || !record.captureState) {
+      throw new Error('label_record_snapshot_missing');
+    }
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const snapshotId = `snap_${createHash('sha256').update(`${record.masterKey}:${record.transcriptHash}`).digest('hex')}`;
+      this.db.prepare(`
+        INSERT OR IGNORE INTO conversation_snapshots
+          (snapshot_id,master_key,transcript_hash,transcript,capture_state,message_count,harness_revision,created_at)
+        VALUES (?,?,?,?,?,?,?,?)
+      `).run(
+        snapshotId, record.masterKey, record.transcriptHash, record.transcript,
+        record.captureState, record.messages?.length ?? 0, input.harnessRevision, input.completedAt,
+      );
+      this.db.prepare(`
+        UPDATE conversation_snapshots SET harness_revision=?
+        WHERE master_key=? AND transcript_hash=?
+      `).run(input.harnessRevision, record.masterKey, record.transcriptHash);
+      this.db.prepare(`
+        UPDATE conversations SET
+          tagging_state=?,business_category=?,problem_type=?,resolution_status=?,
+          overall_confidence=?,needs_review=?,review_reason=?,harness_revision=?,
+          business_reason_code=?,problem_reason_code=?,resolution_reason_code=?,
+          evidence_anchors_json=?,manual_review_status=?,model_attempts=?,
+          model_error=NULL,updated_at=?
+        WHERE master_key=?
+      `).run(
+        tagging.needsReview ? 'needs_review' : 'tagged',
+        tagging.businessCategory, tagging.problemType, tagging.resolutionStatus,
+        tagging.overallConfidence, tagging.needsReview ? 1 : 0,
+        safeMetadata(tagging.reviewReason, 500), input.harnessRevision,
+        tagging.businessReasonCode ?? null, tagging.problemReasonCode ?? null,
+        tagging.resolutionReasonCode ?? null, json(tagging.evidenceAnchors ?? []),
+        tagging.manualReviewStatus ?? 'pending', input.attempt, input.completedAt,
+        record.masterKey,
+      );
+      const labelId = `label_${createHash('sha256').update(`${record.masterKey}:${record.transcriptHash}:${input.harnessRevision}`).digest('hex')}`;
+      this.db.prepare(`
+        INSERT OR REPLACE INTO conversation_labels (
+          label_id,master_key,transcript_hash,harness_revision,business_category,problem_type,
+          resolution_status,overall_confidence,business_reason_code,problem_reason_code,
+          resolution_reason_code,evidence_anchors_json,needs_review,review_reason,
+          manual_review_status,created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+      `).run(
+        labelId, record.masterKey, record.transcriptHash, input.harnessRevision,
+        tagging.businessCategory, tagging.problemType, tagging.resolutionStatus,
+        tagging.overallConfidence, tagging.businessReasonCode ?? null,
+        tagging.problemReasonCode ?? null, tagging.resolutionReasonCode ?? null,
+        json(tagging.evidenceAnchors ?? []), tagging.needsReview ? 1 : 0,
+        safeMetadata(tagging.reviewReason, 500), tagging.manualReviewStatus ?? 'pending',
+        input.completedAt,
+      );
+      this.recordLabelRunInside({
+        masterKey: record.masterKey,
+        transcriptHash: record.transcriptHash,
+        harnessRevision: input.harnessRevision,
+        status: 'completed',
+        model: input.model,
+        attempt: input.attempt,
+        createdAt: input.startedAt,
+        completedAt: input.completedAt,
+      });
+      this.db.exec('COMMIT;');
+    } catch (error) {
+      this.db.exec('ROLLBACK;');
+      throw error;
+    }
+  }
+
+  failLabeling(input: {
+    masterKey: string;
+    transcriptHash: string;
+    harnessRevision: string;
+    attempt: number;
+    model?: string;
+    error: string;
+    startedAt: number;
+    completedAt: number;
+  }): void {
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.recordLabelRunInside({
+        masterKey: input.masterKey,
+        transcriptHash: input.transcriptHash,
+        harnessRevision: input.harnessRevision,
+        status: 'failed',
+        model: input.model,
+        attempt: input.attempt,
+        error: input.error,
+        createdAt: input.startedAt,
+        completedAt: input.completedAt,
+      });
+      this.db.prepare(`
+        UPDATE conversations SET
+          tagging_state=CASE
+            WHEN EXISTS(SELECT 1 FROM conversation_labels cl WHERE cl.master_key=conversations.master_key)
+              THEN tagging_state
+            ELSE 'needs_review'
+          END,
+          needs_review=CASE
+            WHEN EXISTS(SELECT 1 FROM conversation_labels cl WHERE cl.master_key=conversations.master_key)
+              THEN needs_review
+            ELSE 1
+          END,
+          review_reason=CASE
+            WHEN review_reason IS NULL OR review_reason='' THEN '自动打标失败，等待重试'
+            ELSE review_reason
+          END,
+          model_attempts=?,model_error=?,updated_at=MAX(updated_at,?)
+        WHERE master_key=?
+      `).run(
+        input.attempt, safeMetadata(input.error, 500), input.completedAt, input.masterKey,
+      );
+      this.db.exec('COMMIT;');
+    } catch (error) {
+      this.db.exec('ROLLBACK;');
+      throw error;
+    }
+  }
+
   recordLabelRun(input: {
+    masterKey: string;
+    transcriptHash: string;
+    harnessRevision?: string;
+    status: 'running' | 'completed' | 'failed';
+    model?: string;
+    attempt: number;
+    error?: string;
+    createdAt: number;
+    completedAt?: number;
+  }): string {
+    return this.recordLabelRunInside(input);
+  }
+
+  private recordLabelRunInside(input: {
     masterKey: string;
     transcriptHash: string;
     harnessRevision?: string;
@@ -937,18 +1197,21 @@ export class LogisticsConversationStore {
 
   summary(filters: LogisticsConversationFilters = {}): LogisticsConversationSummary {
     const w = where(filters);
+    const analyzable = analyzableConversationCondition();
     const row = this.db.prepare(`
       SELECT COUNT(*) total_sessions,
-        COALESCE(SUM(c.master_key IS NOT NULL),0) conversations,
+        COALESCE(SUM(${analyzable}),0) conversations,
         COALESCE(SUM(c.master_key IS NOT NULL AND EXISTS(SELECT 1 FROM conversation_snapshots cs WHERE cs.master_key=c.master_key)),0) snapshotted,
-        COALESCE(SUM(c.master_key IS NOT NULL AND EXISTS(SELECT 1 FROM conversation_labels cl WHERE cl.master_key=c.master_key)),0) labeled,
+        COALESCE(SUM(${analyzable} AND c.harness_revision IS NOT NULL
+          AND c.business_category IS NOT NULL AND c.problem_type IS NOT NULL
+          AND c.resolution_status IS NOT NULL),0) labeled,
         COALESCE(SUM(sc.backfill_status IN ('pending','processing')),0) pending_backfill,
         COALESCE(SUM(sc.backfill_status IN ('missing_turn','missing_answer','history_failed')),0) failed_backfill,
         COALESCE(SUM((SELECT COUNT(*) FROM conversation_messages cm WHERE cm.session_key=sc.session_key)),0) messages,
-        COALESCE(SUM(c.resolution_status='resolved'),0) resolved,
-        COALESCE(SUM(c.resolution_status='in_progress'),0) in_progress,
-        COALESCE(SUM(c.master_key IS NOT NULL AND (c.resolution_status='unknown' OR c.resolution_status IS NULL)),0) unknown_count,
-        COALESCE(SUM(c.needs_review=1),0) needs_review,
+        COALESCE(SUM(${analyzable} AND c.resolution_status='resolved'),0) resolved,
+        COALESCE(SUM(${analyzable} AND c.resolution_status='in_progress'),0) in_progress,
+        COALESCE(SUM(${analyzable} AND (c.resolution_status='unknown' OR c.resolution_status IS NULL)),0) unknown_count,
+        COALESCE(SUM(${analyzable} AND c.needs_review=1),0) needs_review,
         COALESCE(SUM(c.rating IS NOT NULL),0) rated,
         AVG(c.rating) average_rating
       FROM session_catalog sc
@@ -974,7 +1237,7 @@ export class LogisticsConversationStore {
       pendingBackfill: Number(row.pending_backfill ?? 0),
       failedBackfill: Number(row.failed_backfill ?? 0),
       analysisCoverage: totalSessions ? conversations / totalSessions : 0,
-      labelCoverage: totalSessions ? labeled / totalSessions : 0,
+      labelCoverage: conversations ? labeled / conversations : 0,
       surveyRecords: Number(survey.survey_records ?? 0),
       answeredSurveys: Number(survey.answered_surveys ?? 0),
       messages: Number(row.messages ?? 0),
@@ -991,10 +1254,11 @@ export class LogisticsConversationStore {
 
   trend(filters: LogisticsConversationFilters = {}): Array<{ day: string; totalSessions: number; conversations: number; resolved: number; resolutionRate: number }> {
     const w = where(filters);
+    const analyzable = analyzableConversationCondition();
     return (this.db.prepare(`
       SELECT date(COALESCE(sc.last_message_at,sc.closed_at,sc.created_at,c.updated_at)/1000,'unixepoch','+8 hours') day,
-        COUNT(*) total_sessions, COALESCE(SUM(c.master_key IS NOT NULL),0) conversations,
-        COALESCE(SUM(c.resolution_status='resolved'),0) resolved
+        COUNT(*) total_sessions, COALESCE(SUM(${analyzable}),0) conversations,
+        COALESCE(SUM(${analyzable} AND c.resolution_status='resolved'),0) resolved
       FROM session_catalog sc
       LEFT JOIN conversations c ON c.lark_app_id=sc.lark_app_id AND c.session_id=sc.session_id
       ${w.sql}
@@ -1010,18 +1274,21 @@ export class LogisticsConversationStore {
 
   distributions(filters: LogisticsConversationFilters = {}): Record<string, Array<{ key: string; count: number }>> {
     const w = where(filters);
-    const group = (column: string) => (this.db.prepare(`
+    const group = (column: string, analyzableOnly: boolean) => (this.db.prepare(`
       SELECT COALESCE(${column},'unknown') key, COUNT(*) count
       FROM session_catalog sc
       LEFT JOIN conversations c ON c.lark_app_id=sc.lark_app_id AND c.session_id=sc.session_id
-      ${w.sql} GROUP BY key ORDER BY count DESC,key
+      ${analyzableOnly
+        ? appendWhereCondition(w.sql, analyzableConversationCondition())
+        : w.sql}
+      GROUP BY key ORDER BY count DESC,key
     `).all(...w.params) as any[]).map(row => ({ key: String(row.key), count: Number(row.count) }));
     return {
-      business: group('c.business_category'),
-      problem: group('c.problem_type'),
-      resolution: group('c.resolution_status'),
-      confidence: group('c.overall_confidence'),
-      dataStatus: group('sc.backfill_status'),
+      business: group('c.business_category', true),
+      problem: group('c.problem_type', true),
+      resolution: group('c.resolution_status', true),
+      confidence: group('c.overall_confidence', true),
+      dataStatus: group('sc.backfill_status', false),
     };
   }
 
