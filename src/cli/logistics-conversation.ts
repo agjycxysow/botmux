@@ -5,7 +5,10 @@ import { loadBotConfigs, registerBot, type BotConfig } from '../bot-registry.js'
 import { listChatMessages, listThreadMessages } from '../im/lark/client.js';
 import { parseApiMessage } from '../im/lark/message-parser.js';
 import { buildLogisticsSessionSnapshot } from '../services/logistics-session-capture.js';
-import { LogisticsConversationStore } from '../services/logistics-conversation-store.js';
+import {
+  LogisticsConversationStore,
+  type LogisticsSessionCatalogInput,
+} from '../services/logistics-conversation-store.js';
 import {
   stableLogisticsSessionMasterKey,
   type LogisticsSessionMasterRecord,
@@ -23,12 +26,14 @@ interface BackfillOptions {
   limit: number;
   harnessRoot?: string;
   noLabel: boolean;
+  cursor?: string;
 }
 
 function usage(message?: string): never {
   if (message) console.error(message);
   console.error(`Usage:
-  botmux logistics backfill [--bot <appId>] [--session <id-prefix>] [--since <ISO|YYYY-MM-DD>] [--until <ISO|YYYY-MM-DD>] [--limit N] [--harness-root <dir>] [--no-label] [--apply]
+  botmux logistics sync-catalog [--bot <appId>]
+  botmux logistics backfill [--bot <appId>] [--session <id-prefix>] [--since <ISO|YYYY-MM-DD>] [--until <ISO|YYYY-MM-DD>] [--limit N] [--cursor <opaque>] [--harness-root <dir>] [--no-label] [--apply]
   botmux logistics import-legacy [--bot <appId>]
 
 backfill defaults to dry-run. It reads bounded BotMux session metadata; --apply fetches
@@ -57,7 +62,7 @@ function dateArg(raw: string | undefined, end: boolean): number | undefined {
 }
 
 function parseBackfill(args: string[]): BackfillOptions {
-  const knownWithValue = new Set(['--bot', '--session', '--since', '--until', '--limit', '--harness-root']);
+  const knownWithValue = new Set(['--bot', '--session', '--since', '--until', '--limit', '--cursor', '--harness-root']);
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i]!;
     if (arg === '--apply' || arg === '--no-label') continue;
@@ -77,6 +82,7 @@ function parseBackfill(args: string[]): BackfillOptions {
     limit,
     harnessRoot: value(args, '--harness-root'),
     noLabel: args.includes('--no-label'),
+    cursor: value(args, '--cursor'),
   };
 }
 
@@ -115,8 +121,45 @@ function selectBot(configs: BotConfig[], appId: string | undefined): BotConfig {
   usage('Multiple bots found; pass --bot <appId>');
 }
 
-function candidateSessions(dataDir: string, options: BackfillOptions): Session[] {
-  return [...loadAllSessionsSnapshot({ dataDir }).values()]
+interface LogisticsBackfillCursor {
+  v: 1;
+  at: number;
+  sessionId: string;
+  filter: string;
+}
+
+function filterFingerprint(options: BackfillOptions): string {
+  return JSON.stringify({
+    bot: options.bot ?? '', session: options.session ?? '',
+    since: options.since ?? null, until: options.until ?? null,
+  });
+}
+
+function decodeCursor(raw: string | undefined, options: BackfillOptions): LogisticsBackfillCursor | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as LogisticsBackfillCursor;
+    if (parsed.v !== 1 || !Number.isFinite(parsed.at) || typeof parsed.sessionId !== 'string') throw new Error('shape');
+    if (parsed.filter !== filterFingerprint(options)) throw new Error('filter');
+    return parsed;
+  } catch {
+    throw new Error('invalid_backfill_cursor');
+  }
+}
+
+function encodeCursor(session: Session, options: BackfillOptions): string {
+  const payload: LogisticsBackfillCursor = {
+    v: 1, at: sessionTime(session), sessionId: session.sessionId, filter: filterFingerprint(options),
+  };
+  return Buffer.from(JSON.stringify(payload)).toString('base64url');
+}
+
+export function paginateLogisticsBackfillSessions(
+  input: Iterable<Session>,
+  options: BackfillOptions,
+): { sessions: Session[]; totalCandidates: number; nextCursor?: string; hasMore: boolean } {
+  const cursor = decodeCursor(options.cursor, options);
+  const eligible = [...input]
     .filter(session => !options.bot || session.larkAppId === options.bot)
     .filter(session => !options.session || session.sessionId.startsWith(options.session))
     .filter(session => !session.vcMeetingReceiver && !session.deferredScheduleRun)
@@ -125,8 +168,42 @@ function candidateSessions(dataDir: string, options: BackfillOptions): Session[]
       return (options.since === undefined || at >= options.since)
         && (options.until === undefined || at < options.until);
     })
-    .sort((a, b) => sessionTime(b) - sessionTime(a))
-    .slice(0, options.limit);
+    .sort((a, b) => sessionTime(b) - sessionTime(a) || b.sessionId.localeCompare(a.sessionId));
+  const remaining = cursor
+    ? eligible.filter(session => sessionTime(session) < cursor.at
+      || (sessionTime(session) === cursor.at && session.sessionId.localeCompare(cursor.sessionId) < 0))
+    : eligible;
+  const sessions = remaining.slice(0, options.limit);
+  const hasMore = remaining.length > sessions.length;
+  return {
+    sessions,
+    totalCandidates: eligible.length,
+    hasMore,
+    ...(hasMore && sessions.length ? { nextCursor: encodeCursor(sessions.at(-1)!, options) } : {}),
+  };
+}
+
+export function logisticsSessionCatalogInput(session: Session): LogisticsSessionCatalogInput | undefined {
+  if (!session.larkAppId) return undefined;
+  const createdAt = Date.parse(session.createdAt);
+  if (!Number.isFinite(createdAt)) return undefined;
+  const lastMessageAt = session.lastMessageAt ? Date.parse(session.lastMessageAt) : undefined;
+  const closedAt = session.closedAt ? Date.parse(session.closedAt) : undefined;
+  const specialSession = Boolean(session.vcMeetingReceiver || session.deferredScheduleRun);
+  return {
+    larkAppId: session.larkAppId,
+    sessionId: session.sessionId,
+    chatId: session.chatId,
+    rootMessageId: session.rootMessageId,
+    scope: session.scope === 'chat' ? 'chat' : 'thread',
+    sessionStatus: session.status,
+    title: session.title,
+    createdAt,
+    ...(Number.isFinite(lastMessageAt) ? { lastMessageAt } : {}),
+    ...(Number.isFinite(closedAt) ? { closedAt } : {}),
+    specialSession,
+    ...(specialSession ? { backfillStatus: 'skipped' as const } : {}),
+  };
 }
 
 
@@ -164,7 +241,9 @@ export function inferLogisticsBackfillBoundaries(
 
 async function backfill(dataDir: string, args: string[]): Promise<void> {
   const options = parseBackfill(args);
-  const sessions = candidateSessions(dataDir, options);
+  const allSessions = [...loadAllSessionsSnapshot({ dataDir }).values()];
+  const page = paginateLogisticsBackfillSessions(allSessions, options);
+  const { sessions } = page;
   const audit = sessions.map(session => {
     const marker = latestSendMarker(dataDir, session.sessionId);
     return {
@@ -177,12 +256,19 @@ async function backfill(dataDir: string, args: string[]): Promise<void> {
     };
   });
   if (!options.apply) {
-    console.log(JSON.stringify({ mode: 'dry-run', candidateCount: audit.length, candidates: audit }, null, 2));
+    console.log(JSON.stringify({
+      mode: 'dry-run', candidateCount: audit.length, totalCandidates: page.totalCandidates,
+      hasMore: page.hasMore, nextCursor: page.nextCursor ?? null, candidates: audit,
+    }, null, 2));
     return;
   }
 
   if (sessions.length === 0) {
-    console.log(JSON.stringify({ mode: 'apply', candidates: 0, imported: 0, skipped: {}, failed: 0, failures: [] }, null, 2));
+    console.log(JSON.stringify({
+      mode: 'apply', candidates: 0, totalCandidates: page.totalCandidates,
+      hasMore: page.hasMore, nextCursor: page.nextCursor ?? null,
+      imported: 0, skipped: {}, failed: 0, failures: [],
+    }, null, 2));
     return;
   }
   const configs = loadBotConfigs();
@@ -190,6 +276,10 @@ async function backfill(dataDir: string, args: string[]): Promise<void> {
   const bot = selectBot(configs, options.bot ?? (sessionApps.length === 1 ? sessionApps[0] : undefined));
   registerBot(bot);
   const store = new LogisticsConversationStore({ dataDir, path: bot.logisticsSessionMaster?.sqlite?.path });
+  store.syncSessionCatalog(allSessions
+    .filter(session => session.larkAppId === bot.larkAppId)
+    .map(logisticsSessionCatalogInput)
+    .filter((row): row is LogisticsSessionCatalogInput => !!row));
   const runner = options.noLabel ? undefined : createLogisticsSessionModelTaskRunner({
     cliId: bot.cliId,
     cliPathOverride: bot.cliPathOverride,
@@ -202,6 +292,9 @@ async function backfill(dataDir: string, args: string[]): Promise<void> {
   const result = {
     mode: 'apply',
     candidates: sessions.length,
+    totalCandidates: page.totalCandidates,
+    hasMore: page.hasMore,
+    nextCursor: page.nextCursor ?? null,
     imported: 0,
     skipped: {} as Record<string, number>,
     failed: 0,
@@ -210,8 +303,13 @@ async function backfill(dataDir: string, args: string[]): Promise<void> {
   const skip = (reason: string) => { result.skipped[reason] = (result.skipped[reason] ?? 0) + 1; };
   try {
     for (const session of sessions) {
-      if (session.larkAppId !== bot.larkAppId) { skip('different_bot'); continue; }
+      if (session.larkAppId !== bot.larkAppId) {
+        skip('different_bot');
+        if (session.larkAppId) store.markSessionBackfill(session.larkAppId, session.sessionId, 'skipped', 'different_bot');
+        continue;
+      }
       const marker = latestSendMarker(dataDir, session.sessionId);
+      store.markSessionBackfill(bot.larkAppId, session.sessionId, 'processing');
       try {
         const raw = session.scope === 'chat'
           ? await listChatMessages(bot.larkAppId, session.chatId, 200)
@@ -230,8 +328,16 @@ async function backfill(dataDir: string, args: string[]): Promise<void> {
           session.quoteTargetId ?? (session.rootMessageId.startsWith('om_') ? session.rootMessageId : undefined),
           marker.messageId,
         );
-        if (!boundary.turnId) { skip('missing_turn'); continue; }
-        if (!boundary.answerMessageId) { skip('missing_answer'); continue; }
+        if (!boundary.turnId) {
+          skip('missing_turn');
+          store.markSessionBackfill(bot.larkAppId, session.sessionId, 'missing_turn');
+          continue;
+        }
+        if (!boundary.answerMessageId) {
+          skip('missing_answer');
+          store.markSessionBackfill(bot.larkAppId, session.sessionId, 'missing_answer');
+          continue;
+        }
         const snapshot = buildLogisticsSessionSnapshot({
           turnId: boundary.turnId,
           answerMessageId: boundary.answerMessageId,
@@ -271,30 +377,42 @@ async function backfill(dataDir: string, args: string[]): Promise<void> {
           createdAt: Date.parse(session.createdAt) || now,
           updatedAt: marker.sentAtMs ?? (sessionTime(session) || now),
         };
+        store.markSessionBackfill(bot.larkAppId, session.sessionId, 'snapshot_ready');
         if (runner) {
-          const tagging = await runner({ record });
-          Object.assign(record, {
-            businessCategory: tagging.businessCategory,
-            problemType: tagging.problemType,
-            resolutionStatus: tagging.resolutionStatus,
-            overallConfidence: tagging.overallConfidence,
-            needsReview: record.needsReview || tagging.needsReview,
-            reviewReason: [record.reviewReason, tagging.reviewReason].filter(Boolean).join('；') || undefined,
-            harnessRevision: tagging.harnessRevision,
-            businessReasonCode: tagging.businessReasonCode,
-            problemReasonCode: tagging.problemReasonCode,
-            resolutionReasonCode: tagging.resolutionReasonCode,
-            evidenceAnchors: tagging.evidenceAnchors,
-            taggingState: tagging.needsReview ? 'needs_review' : 'tagged',
-          });
+          try {
+            const tagging = await runner({ record });
+            Object.assign(record, {
+              businessCategory: tagging.businessCategory,
+              problemType: tagging.problemType,
+              resolutionStatus: tagging.resolutionStatus,
+              overallConfidence: tagging.overallConfidence,
+              needsReview: record.needsReview || tagging.needsReview,
+              reviewReason: [record.reviewReason, tagging.reviewReason].filter(Boolean).join('；') || undefined,
+              harnessRevision: tagging.harnessRevision,
+              businessReasonCode: tagging.businessReasonCode,
+              problemReasonCode: tagging.problemReasonCode,
+              resolutionReasonCode: tagging.resolutionReasonCode,
+              evidenceAnchors: tagging.evidenceAnchors,
+              taggingState: tagging.needsReview ? 'needs_review' : 'tagged',
+            });
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            record.taggingState = 'needs_review';
+            record.needsReview = true;
+            record.modelError = reason.slice(0, 500);
+            record.reviewReason = [record.reviewReason, `历史打标失败：${reason.slice(0, 200)}`]
+              .filter(Boolean).join('；');
+          }
         }
         store.upsert(record);
         result.imported += 1;
       } catch (error) {
+        const reason = error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300);
+        store.markSessionBackfill(bot.larkAppId, session.sessionId, 'history_failed', reason);
         result.failed += 1;
         if (result.failures.length < 20) result.failures.push({
           session: session.sessionId.slice(0, 12),
-          reason: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300),
+          reason,
         });
       }
     }
@@ -302,6 +420,23 @@ async function backfill(dataDir: string, args: string[]): Promise<void> {
     store.close();
   }
   console.log(JSON.stringify(result, null, 2));
+}
+
+function syncCatalog(dataDir: string, args: string[]): void {
+  const bot = value(args, '--bot');
+  const unknown = args.filter((arg, index) => arg !== '--bot' && args[index - 1] !== '--bot' && !arg.startsWith('--bot='));
+  if (unknown.length) usage(`Unknown option: ${unknown[0]}`);
+  const rows = [...loadAllSessionsSnapshot({ dataDir }).values()]
+    .filter(session => !bot || session.larkAppId === bot)
+    .map(logisticsSessionCatalogInput)
+    .filter((row): row is LogisticsSessionCatalogInput => !!row);
+  const store = new LogisticsConversationStore({ dataDir });
+  try {
+    const synced = store.syncSessionCatalog(rows);
+    console.log(JSON.stringify({ mode: 'sync-catalog', ...synced, summary: store.summary(bot ? { larkAppId: bot } : {}) }, null, 2));
+  } finally {
+    store.close();
+  }
 }
 
 function importLegacy(dataDir: string, args: string[]): void {
@@ -314,6 +449,7 @@ function importLegacy(dataDir: string, args: string[]): void {
 }
 
 export async function runLogisticsConversationCommand(sub: string, args: string[], dataDir: string): Promise<void> {
+  if (sub === 'sync-catalog') return syncCatalog(dataDir, args);
   if (sub === 'backfill') return backfill(dataDir, args);
   if (sub === 'import-legacy') return importLegacy(dataDir, args);
   usage();

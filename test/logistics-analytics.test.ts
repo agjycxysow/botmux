@@ -37,6 +37,16 @@ describe('standalone logistics analytics server', () => {
   it('serves an authenticated overview page and read-only APIs', async () => {
     const dataDir = await tempDir();
     const store = new LogisticsConversationStore({ dataDir });
+    store.syncSessionCatalog([
+      {
+        larkAppId: 'cli_logistics', sessionId: 'session-1', chatId: 'oc_chat', rootMessageId: 'om_root',
+        scope: 'thread', sessionStatus: 'active', title: '会话', createdAt: 1_000, lastMessageAt: 2_000,
+      },
+      {
+        larkAppId: 'cli_logistics', sessionId: 'session-2', chatId: 'oc_chat_2', rootMessageId: 'om_root_2',
+        scope: 'thread', sessionStatus: 'closed', title: '待回溯会话', createdAt: 3_000, lastMessageAt: 4_000,
+      },
+    ]);
     store.upsert(record());
     store.close();
 
@@ -53,10 +63,21 @@ describe('standalone logistics analytics server', () => {
       const headers = { authorization: 'Bearer secret' };
       const overview = await fetch(`${base}/api/overview`, { headers });
       expect(overview.status).toBe(200);
-      await expect(overview.json()).resolves.toMatchObject({ conversations: 1, resolved: 1 });
+      await expect(overview.json()).resolves.toMatchObject({
+        totalSessions: 2, conversations: 1, labeled: 1, pendingBackfill: 1,
+        analysisCoverage: 0.5, labelCoverage: 0.5, resolved: 1,
+      });
+      const pending = await fetch(`${base}/api/sessions?dataStatus=pending`, { headers });
+      await expect(pending.json()).resolves.toMatchObject({
+        total: 1,
+        items: [expect.objectContaining({ dataStatus: 'pending', title: '待回溯会话' })],
+      });
       const page = await fetch(`${base}/overview`, { headers });
       expect(page.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
-      expect(await page.text()).toContain('物流专家 · 数据概览');
+      const pageText = await page.text();
+      expect(pageText).toContain('物流专家 · 数据概览');
+      expect(pageText).toContain('分析覆盖率');
+      expect(pageText).toContain('全部数据状态');
       const exchange = await fetch(`${base}/overview?t=secret`, {
         redirect: 'manual',
         headers: { 'x-forwarded-proto': 'https' },

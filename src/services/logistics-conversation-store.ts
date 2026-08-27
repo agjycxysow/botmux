@@ -11,13 +11,40 @@ import type {
 
 const require = createRequire(import.meta.url);
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const DEFAULT_FILE = 'botmux-conversations.sqlite';
 
 export interface LogisticsConversationStoreOptions {
   dataDir: string;
   path?: string;
   readOnly?: boolean;
+}
+
+export type LogisticsBackfillStatus =
+  | 'pending'
+  | 'processing'
+  | 'missing_turn'
+  | 'missing_answer'
+  | 'history_failed'
+  | 'snapshot_ready'
+  | 'labeled'
+  | 'label_failed'
+  | 'skipped';
+
+export interface LogisticsSessionCatalogInput {
+  larkAppId: string;
+  sessionId: string;
+  chatId: string;
+  rootMessageId: string;
+  scope: 'thread' | 'chat';
+  sessionStatus: 'active' | 'closed' | 'unknown';
+  title?: string;
+  createdAt: number;
+  lastMessageAt?: number;
+  closedAt?: number;
+  backfillStatus?: LogisticsBackfillStatus;
+  backfillError?: string;
+  specialSession?: boolean;
 }
 
 export interface LogisticsConversationFilters {
@@ -28,10 +55,18 @@ export interface LogisticsConversationFilters {
   problemType?: string;
   resolutionStatus?: string;
   needsReview?: boolean;
+  dataStatus?: LogisticsBackfillStatus;
 }
 
 export interface LogisticsConversationSummary {
+  totalSessions: number;
   conversations: number;
+  snapshotted: number;
+  labeled: number;
+  pendingBackfill: number;
+  failedBackfill: number;
+  analysisCoverage: number;
+  labelCoverage: number;
   messages: number;
   resolved: number;
   inProgress: number;
@@ -43,8 +78,12 @@ export interface LogisticsConversationSummary {
 }
 
 export interface LogisticsConversationListItem {
-  conversationId: string;
+  sessionPublicId: string;
+  conversationId?: string;
   larkAppId: string;
+  sessionStatus: string;
+  scope: string;
+  dataStatus: LogisticsBackfillStatus;
   title?: string;
   captureState?: string;
   taggingState: string;
@@ -123,7 +162,7 @@ function toIsoBoundary(value: string | undefined, end: boolean): number | undefi
   return dayOnly && end ? parsed + 24 * 60 * 60_000 : parsed;
 }
 
-function where(filters: LogisticsConversationFilters, alias = 'c'): { sql: string; params: SqlParams } {
+function where(filters: LogisticsConversationFilters, conversationAlias = 'c', catalogAlias = 'sc'): { sql: string; params: SqlParams } {
   const clauses: string[] = [];
   const params: SqlParams = [];
   const from = toIsoBoundary(filters.from, false);
@@ -131,23 +170,30 @@ function where(filters: LogisticsConversationFilters, alias = 'c'): { sql: strin
   if (from !== undefined && to !== undefined && to - from > 366 * 24 * 60 * 60_000) {
     throw new Error('analytics_range_too_large');
   }
-  if (from !== undefined) { clauses.push(`${alias}.updated_at>=?`); params.push(from); }
-  if (to !== undefined) { clauses.push(`${alias}.updated_at<?`); params.push(to); }
+  const timeColumn = `COALESCE(${catalogAlias}.last_message_at,${catalogAlias}.closed_at,${catalogAlias}.created_at,${conversationAlias}.updated_at)`;
+  if (from !== undefined) { clauses.push(`${timeColumn}>=?`); params.push(from); }
+  if (to !== undefined) { clauses.push(`${timeColumn}<?`); params.push(to); }
   const columns: Array<[string | undefined, string]> = [
-    [filters.larkAppId, 'lark_app_id'],
-    [filters.businessCategory, 'business_category'],
-    [filters.problemType, 'problem_type'],
-    [filters.resolutionStatus, 'resolution_status'],
+    [filters.larkAppId, `${catalogAlias}.lark_app_id`],
+    [filters.businessCategory, `${conversationAlias}.business_category`],
+    [filters.problemType, `${conversationAlias}.problem_type`],
+    [filters.resolutionStatus, `${conversationAlias}.resolution_status`],
+    [filters.dataStatus, `${catalogAlias}.backfill_status`],
   ];
   for (const [value, column] of columns) {
-    if (value) { clauses.push(`${alias}.${column}=?`); params.push(value); }
+    if (value) { clauses.push(`${column}=?`); params.push(value); }
   }
   if (filters.needsReview !== undefined) {
-    clauses.push(`${alias}.needs_review=?`);
+    clauses.push(`${conversationAlias}.needs_review=?`);
     params.push(filters.needsReview ? 1 : 0);
   }
   return { sql: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '', params };
 }
+
+function sessionPublicId(larkAppId: string, sessionId: string): string {
+  return `sess_${createHash('sha256').update(`${larkAppId}:${sessionId}`).digest('hex').slice(0, 32)}`;
+}
+
 
 export class LogisticsConversationStore {
   readonly path: string;
@@ -168,6 +214,82 @@ export class LogisticsConversationStore {
 
   close(): void { this.db.close(); }
 
+  syncSessionCatalog(rows: LogisticsSessionCatalogInput[]): { total: number; inserted: number } {
+    let inserted = 0;
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      for (const row of rows) {
+        const result = this.insertCatalogRow(row);
+        inserted += Number(result.changes ?? 0);
+        this.db.prepare(`
+          UPDATE session_catalog SET
+            chat_id=?,root_message_id=?,scope=?,session_status=?,title=?,created_at=?,
+            last_message_at=?,closed_at=?,special_session=?,updated_at=?
+          WHERE lark_app_id=? AND session_id=?
+        `).run(
+          row.chatId, row.rootMessageId, row.scope, row.sessionStatus,
+          safeMetadata(row.title, 120), row.createdAt, row.lastMessageAt ?? null,
+          row.closedAt ?? null, row.specialSession ? 1 : 0,
+          Math.max(row.lastMessageAt ?? 0, row.closedAt ?? 0, row.createdAt),
+          row.larkAppId, row.sessionId,
+        );
+        if (row.backfillStatus) {
+          this.markSessionBackfillInside(row.larkAppId, row.sessionId, row.backfillStatus, row.backfillError);
+        }
+      }
+      this.db.exec('COMMIT;');
+    } catch (error) {
+      this.db.exec('ROLLBACK;');
+      throw error;
+    }
+    return { total: rows.length, inserted };
+  }
+
+  markSessionBackfill(
+    larkAppId: string,
+    sessionId: string,
+    status: LogisticsBackfillStatus,
+    error?: string,
+    conversationId?: string,
+  ): void {
+    this.markSessionBackfillInside(larkAppId, sessionId, status, error, conversationId);
+  }
+
+  private insertCatalogRow(row: LogisticsSessionCatalogInput): { changes?: number | bigint } {
+    const key = `${row.larkAppId}:${row.sessionId}`;
+    const updatedAt = Math.max(row.lastMessageAt ?? 0, row.closedAt ?? 0, row.createdAt);
+    return this.db.prepare(`
+      INSERT OR IGNORE INTO session_catalog (
+        session_key,public_id,lark_app_id,session_id,chat_id,root_message_id,scope,
+        session_status,title,created_at,last_message_at,closed_at,special_session,
+        backfill_status,backfill_error,updated_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    `).run(
+      key, sessionPublicId(row.larkAppId, row.sessionId), row.larkAppId, row.sessionId,
+      row.chatId, row.rootMessageId, row.scope, row.sessionStatus, safeMetadata(row.title, 120),
+      row.createdAt, row.lastMessageAt ?? null, row.closedAt ?? null, row.specialSession ? 1 : 0,
+      row.backfillStatus ?? 'pending', safeMetadata(row.backfillError, 500), updatedAt,
+    );
+  }
+
+  private markSessionBackfillInside(
+    larkAppId: string,
+    sessionId: string,
+    status: LogisticsBackfillStatus,
+    error?: string,
+    conversationId?: string,
+  ): void {
+    this.db.prepare(`
+      UPDATE session_catalog SET backfill_status=?,backfill_error=?,
+        backfill_attempts=backfill_attempts+CASE WHEN ?='processing' THEN 1 ELSE 0 END,
+        last_backfill_at=?,conversation_public_id=COALESCE(?,conversation_public_id)
+      WHERE lark_app_id=? AND session_id=?
+    `).run(
+      status, safeMetadata(error, 500), status, Date.now(), conversationId ?? null,
+      larkAppId, sessionId,
+    );
+  }
+
   private migrate(): void {
     const version = Number((this.db.prepare('PRAGMA user_version').get() as any)?.user_version ?? 0);
     if (version > SCHEMA_VERSION) throw new Error(`logistics_conversation_schema_newer:${version}`);
@@ -175,6 +297,32 @@ export class LogisticsConversationStore {
     this.db.exec('BEGIN IMMEDIATE;');
     try {
       this.db.exec(`
+        CREATE TABLE IF NOT EXISTS session_catalog (
+          session_key TEXT PRIMARY KEY,
+          public_id TEXT NOT NULL UNIQUE,
+          lark_app_id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          chat_id TEXT NOT NULL,
+          root_message_id TEXT NOT NULL,
+          scope TEXT NOT NULL CHECK(scope IN ('thread','chat')),
+          session_status TEXT NOT NULL CHECK(session_status IN ('active','closed','unknown')),
+          title TEXT,
+          created_at INTEGER NOT NULL,
+          last_message_at INTEGER,
+          closed_at INTEGER,
+          special_session INTEGER NOT NULL DEFAULT 0,
+          backfill_status TEXT NOT NULL DEFAULT 'pending',
+          backfill_error TEXT,
+          backfill_attempts INTEGER NOT NULL DEFAULT 0,
+          last_backfill_at INTEGER,
+          conversation_public_id TEXT,
+          updated_at INTEGER NOT NULL,
+          UNIQUE(lark_app_id, session_id)
+        );
+        CREATE INDEX IF NOT EXISTS session_catalog_updated ON session_catalog(updated_at DESC,session_key DESC);
+        CREATE INDEX IF NOT EXISTS session_catalog_bot_updated ON session_catalog(lark_app_id,updated_at DESC,session_key DESC);
+        CREATE INDEX IF NOT EXISTS session_catalog_backfill ON session_catalog(backfill_status,updated_at DESC);
+
         CREATE TABLE IF NOT EXISTS conversations (
           master_key TEXT PRIMARY KEY,
           public_id TEXT NOT NULL UNIQUE,
@@ -291,6 +439,17 @@ export class LogisticsConversationStore {
       : null;
     this.db.exec('BEGIN IMMEDIATE;');
     try {
+      this.insertCatalogRow({
+        larkAppId: record.larkAppId,
+        sessionId: record.sessionId,
+        chatId: record.chatId,
+        rootMessageId: record.rootMessageId ?? '',
+        scope: record.rootMessageId ? 'thread' : 'chat',
+        sessionStatus: 'unknown',
+        title: record.title,
+        createdAt: record.createdAt,
+        lastMessageAt: record.updatedAt,
+      });
       this.db.prepare(`
         INSERT INTO conversations (
           master_key,public_id,lark_app_id,session_id,turn_id,survey_id,chat_id,root_message_id,
@@ -330,6 +489,14 @@ export class LogisticsConversationStore {
         json(record.evidenceAnchors ?? []), record.manualReviewStatus ?? 'pending', record.modelAttempts,
         safeMetadata(record.modelError, 500), record.createdAt, record.updatedAt,
       );
+
+      const conversationId = publicId(record.masterKey);
+      const catalogStatus: LogisticsBackfillStatus = record.modelError
+        ? 'label_failed'
+        : record.businessCategory && record.problemType && record.resolutionStatus
+          ? 'labeled'
+          : record.transcript && record.transcriptHash ? 'snapshot_ready' : 'pending';
+      this.markSessionBackfillInside(record.larkAppId, record.sessionId, catalogStatus, record.modelError, conversationId);
 
       if (record.transcript && record.transcriptHash && record.captureState) {
         const snapshotId = `snap_${createHash('sha256').update(`${record.masterKey}:${record.transcriptHash}`).digest('hex')}`;
@@ -430,20 +597,36 @@ export class LogisticsConversationStore {
   summary(filters: LogisticsConversationFilters = {}): LogisticsConversationSummary {
     const w = where(filters);
     const row = this.db.prepare(`
-      SELECT COUNT(*) conversations,
-        COALESCE(SUM(message_count),0) messages,
-        COALESCE(SUM(resolution_status='resolved'),0) resolved,
-        COALESCE(SUM(resolution_status='in_progress'),0) in_progress,
-        COALESCE(SUM(resolution_status='unknown' OR resolution_status IS NULL),0) unknown_count,
-        COALESCE(SUM(needs_review=1),0) needs_review,
-        COALESCE(SUM(rating IS NOT NULL),0) rated,
-        AVG(rating) average_rating
-      FROM conversations c ${w.sql}
+      SELECT COUNT(*) total_sessions,
+        COALESCE(SUM(c.master_key IS NOT NULL),0) conversations,
+        COALESCE(SUM(sc.backfill_status IN ('snapshot_ready','labeled','label_failed')),0) snapshotted,
+        COALESCE(SUM(sc.backfill_status='labeled'),0) labeled,
+        COALESCE(SUM(sc.backfill_status IN ('pending','processing','missing_turn','missing_answer')),0) pending_backfill,
+        COALESCE(SUM(sc.backfill_status IN ('history_failed','label_failed')),0) failed_backfill,
+        COALESCE(SUM(c.message_count),0) messages,
+        COALESCE(SUM(c.resolution_status='resolved'),0) resolved,
+        COALESCE(SUM(c.resolution_status='in_progress'),0) in_progress,
+        COALESCE(SUM(c.master_key IS NOT NULL AND (c.resolution_status='unknown' OR c.resolution_status IS NULL)),0) unknown_count,
+        COALESCE(SUM(c.needs_review=1),0) needs_review,
+        COALESCE(SUM(c.rating IS NOT NULL),0) rated,
+        AVG(c.rating) average_rating
+      FROM session_catalog sc
+      LEFT JOIN conversations c ON c.lark_app_id=sc.lark_app_id AND c.session_id=sc.session_id
+      ${w.sql}
     `).get(...w.params) as any;
+    const totalSessions = Number(row.total_sessions ?? 0);
     const conversations = Number(row.conversations ?? 0);
+    const labeled = Number(row.labeled ?? 0);
     const resolved = Number(row.resolved ?? 0);
     return {
+      totalSessions,
       conversations,
+      snapshotted: Number(row.snapshotted ?? 0),
+      labeled,
+      pendingBackfill: Number(row.pending_backfill ?? 0),
+      failedBackfill: Number(row.failed_backfill ?? 0),
+      analysisCoverage: totalSessions ? conversations / totalSessions : 0,
+      labelCoverage: totalSessions ? labeled / totalSessions : 0,
       messages: Number(row.messages ?? 0),
       resolved,
       inProgress: Number(row.in_progress ?? 0),
@@ -456,15 +639,19 @@ export class LogisticsConversationStore {
     };
   }
 
-  trend(filters: LogisticsConversationFilters = {}): Array<{ day: string; conversations: number; resolved: number; resolutionRate: number }> {
+  trend(filters: LogisticsConversationFilters = {}): Array<{ day: string; totalSessions: number; conversations: number; resolved: number; resolutionRate: number }> {
     const w = where(filters);
     return (this.db.prepare(`
-      SELECT date(updated_at/1000,'unixepoch','+8 hours') day,
-        COUNT(*) conversations, COALESCE(SUM(resolution_status='resolved'),0) resolved
-      FROM conversations c ${w.sql}
+      SELECT date(COALESCE(sc.last_message_at,sc.closed_at,sc.created_at,c.updated_at)/1000,'unixepoch','+8 hours') day,
+        COUNT(*) total_sessions, COALESCE(SUM(c.master_key IS NOT NULL),0) conversations,
+        COALESCE(SUM(c.resolution_status='resolved'),0) resolved
+      FROM session_catalog sc
+      LEFT JOIN conversations c ON c.lark_app_id=sc.lark_app_id AND c.session_id=sc.session_id
+      ${w.sql}
       GROUP BY day ORDER BY day
     `).all(...w.params) as any[]).map(row => ({
       day: String(row.day),
+      totalSessions: Number(row.total_sessions),
       conversations: Number(row.conversations),
       resolved: Number(row.resolved),
       resolutionRate: Number(row.conversations) ? Number(row.resolved) / Number(row.conversations) : 0,
@@ -475,13 +662,16 @@ export class LogisticsConversationStore {
     const w = where(filters);
     const group = (column: string) => (this.db.prepare(`
       SELECT COALESCE(${column},'unknown') key, COUNT(*) count
-      FROM conversations c ${w.sql} GROUP BY key ORDER BY count DESC,key
+      FROM session_catalog sc
+      LEFT JOIN conversations c ON c.lark_app_id=sc.lark_app_id AND c.session_id=sc.session_id
+      ${w.sql} GROUP BY key ORDER BY count DESC,key
     `).all(...w.params) as any[]).map(row => ({ key: String(row.key), count: Number(row.count) }));
     return {
-      business: group('business_category'),
-      problem: group('problem_type'),
-      resolution: group('resolution_status'),
-      confidence: group('overall_confidence'),
+      business: group('c.business_category'),
+      problem: group('c.problem_type'),
+      resolution: group('c.resolution_status'),
+      confidence: group('c.overall_confidence'),
+      dataStatus: group('sc.backfill_status'),
     };
   }
 
@@ -491,16 +681,30 @@ export class LogisticsConversationStore {
     const rawOffset = Number(page.offset ?? 0);
     const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(Math.trunc(rawLimit), 200)) : 50;
     const offset = Number.isFinite(rawOffset) ? Math.max(0, Math.trunc(rawOffset)) : 0;
-    const total = Number((this.db.prepare(`SELECT COUNT(*) count FROM conversations c ${w.sql}`).get(...w.params) as any)?.count ?? 0);
+    const joins = `FROM session_catalog sc LEFT JOIN conversations c ON c.lark_app_id=sc.lark_app_id AND c.session_id=sc.session_id`;
+    const total = Number((this.db.prepare(`SELECT COUNT(*) count ${joins} ${w.sql}`).get(...w.params) as any)?.count ?? 0);
     const rows = this.db.prepare(`
-      SELECT * FROM conversations c ${w.sql}
-      ORDER BY updated_at DESC,master_key DESC LIMIT ? OFFSET ?
+      SELECT sc.public_id session_public_id,sc.lark_app_id,sc.session_status,sc.scope,
+        sc.backfill_status,sc.title session_title,sc.created_at session_created_at,
+        COALESCE(sc.last_message_at,sc.closed_at,sc.created_at) session_updated_at,
+        c.public_id conversation_id,c.capture_state,c.tagging_state,c.business_category,
+        c.problem_type,c.resolution_status,c.overall_confidence,c.needs_review,c.review_reason,
+        c.rating,c.rating_count,c.message_count
+      ${joins} ${w.sql}
+      ORDER BY session_updated_at DESC,sc.session_key DESC LIMIT ? OFFSET ?
     `).all(...w.params, limit, offset) as any[];
-    return { total, items: rows.map(row => this.listItem(row)) };
+    return { total, items: rows.map(row => this.catalogListItem(row)) };
   }
 
   detail(conversationId: string): LogisticsConversationDetail | undefined {
-    const row = this.db.prepare('SELECT * FROM conversations WHERE public_id=?').get(conversationId) as any;
+    const row = this.db.prepare(`
+      SELECT c.*,sc.public_id session_public_id,sc.session_status,sc.scope,sc.backfill_status,
+        sc.title session_title,sc.created_at session_created_at,
+        COALESCE(sc.last_message_at,sc.closed_at,sc.created_at) session_updated_at
+      FROM conversations c JOIN session_catalog sc
+        ON c.lark_app_id=sc.lark_app_id AND c.session_id=sc.session_id
+      WHERE c.public_id=?
+    `).get(conversationId) as any;
     if (!row) return undefined;
     const snapshotRows = this.db.prepare(`
       SELECT snapshot_id,transcript_hash,capture_state,message_count,harness_revision,created_at
@@ -517,7 +721,11 @@ export class LogisticsConversationStore {
         }))
       : [];
     return {
-      ...this.listItem(row),
+      ...this.catalogListItem({
+        ...row, conversation_id: row.public_id, session_public_id: row.session_public_id,
+        session_title: row.title ?? row.session_title, session_created_at: row.session_created_at,
+        session_updated_at: row.session_updated_at, backfill_status: row.backfill_status,
+      }),
       ...(row.transcript ? { transcript: String(row.transcript) } : {}),
       ...(row.transcript_hash ? { transcriptHash: String(row.transcript_hash) } : {}),
       ...(row.harness_revision ? { harnessRevision: String(row.harness_revision) } : {}),
@@ -535,12 +743,17 @@ export class LogisticsConversationStore {
     };
   }
 
-  private listItem(row: any): LogisticsConversationListItem {
+  private catalogListItem(row: any): LogisticsConversationListItem {
     return {
-      conversationId: String(row.public_id), larkAppId: String(row.lark_app_id),
-      ...(row.title ? { title: String(row.title) } : {}),
+      sessionPublicId: String(row.session_public_id),
+      ...(row.conversation_id ? { conversationId: String(row.conversation_id) } : {}),
+      larkAppId: String(row.lark_app_id),
+      sessionStatus: String(row.session_status ?? 'unknown'),
+      scope: String(row.scope ?? 'thread'),
+      dataStatus: String(row.backfill_status ?? 'pending') as LogisticsBackfillStatus,
+      ...(row.session_title ? { title: String(row.session_title) } : {}),
       ...(row.capture_state ? { captureState: String(row.capture_state) } : {}),
-      taggingState: String(row.tagging_state),
+      taggingState: String(row.tagging_state ?? 'pending'),
       ...(row.business_category ? { businessCategory: String(row.business_category) } : {}),
       ...(row.problem_type ? { problemType: String(row.problem_type) } : {}),
       ...(row.resolution_status ? { resolutionStatus: String(row.resolution_status) } : {}),
@@ -549,7 +762,7 @@ export class LogisticsConversationStore {
       ...(row.review_reason ? { reviewReason: String(row.review_reason) } : {}),
       ...(row.rating !== null && row.rating !== undefined ? { rating: Number(row.rating) } : {}),
       ratingCount: Number(row.rating_count ?? 0), messageCount: Number(row.message_count ?? 0),
-      createdAt: Number(row.created_at), updatedAt: Number(row.updated_at),
+      createdAt: Number(row.session_created_at), updatedAt: Number(row.session_updated_at),
     };
   }
 }

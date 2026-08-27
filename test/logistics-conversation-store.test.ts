@@ -146,3 +146,42 @@ describe('logistics conversation SQLite store', () => {
     store.close();
   });
 });
+
+describe('logistics session catalog coverage', () => {
+  it('keeps the full session denominator separate from analyzable conversations', async () => {
+    const dataDir = await tempDir();
+    const store = new LogisticsConversationStore({ dataDir });
+    const rows = [1, 2, 3].map(index => ({
+      larkAppId: 'cli_logistics',
+      sessionId: `session-${index}`,
+      chatId: `oc_chat_${index}`,
+      rootMessageId: `om_root_${index}`,
+      scope: 'thread' as const,
+      sessionStatus: index === 3 ? 'closed' as const : 'active' as const,
+      title: `会话 ${index}`,
+      createdAt: 1_000 * index,
+      lastMessageAt: 2_000 * index,
+    }));
+    expect(store.syncSessionCatalog(rows)).toEqual({ total: 3, inserted: 3 });
+    expect(store.syncSessionCatalog(rows)).toEqual({ total: 3, inserted: 0 });
+    store.upsert(record());
+
+    expect(store.summary()).toMatchObject({
+      totalSessions: 3,
+      conversations: 1,
+      snapshotted: 1,
+      labeled: 1,
+      pendingBackfill: 2,
+      failedBackfill: 0,
+      analysisCoverage: 1 / 3,
+      labelCoverage: 1 / 3,
+    });
+    expect(store.list({ dataStatus: 'pending' })).toMatchObject({ total: 2 });
+    expect(store.list({ dataStatus: 'pending' }).items[0]).not.toHaveProperty('conversationId');
+    expect(store.list({ dataStatus: 'labeled' }).items[0]).toMatchObject({
+      conversationId: expect.stringMatching(/^conv_/),
+      dataStatus: 'labeled',
+    });
+    store.close();
+  });
+});
