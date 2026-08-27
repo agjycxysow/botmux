@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
@@ -201,9 +201,11 @@ function sessionPublicId(larkAppId: string, sessionId: string): string {
 export class LogisticsConversationStore {
   readonly path: string;
   private readonly db: DatabaseSyncType;
+  private readonly writable: boolean;
 
   constructor(options: LogisticsConversationStoreOptions) {
     this.path = sqlitePath(options);
+    this.writable = !options.readOnly;
     if (!options.readOnly) mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
     const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
     this.db = new DatabaseSync(this.path, options.readOnly ? { readOnly: true } : {});
@@ -212,10 +214,23 @@ export class LogisticsConversationStore {
     if (!options.readOnly) {
       this.db.exec('PRAGMA journal_mode=WAL;');
       this.migrate();
+      this.secureFiles();
     }
   }
 
-  close(): void { this.db.close(); }
+  close(): void {
+    this.secureFiles();
+    this.db.close();
+    this.secureFiles();
+  }
+
+  private secureFiles(): void {
+    if (!this.writable) return;
+    for (const path of [this.path, `${this.path}-wal`, `${this.path}-shm`]) {
+      if (!existsSync(path)) continue;
+      try { chmodSync(path, 0o600); } catch { /* parent directory permissions remain authoritative */ }
+    }
+  }
 
   syncSessionCatalog(rows: LogisticsSessionCatalogInput[]): { total: number; inserted: number } {
     let inserted = 0;
