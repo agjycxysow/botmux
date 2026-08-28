@@ -104,14 +104,15 @@ function sdkClient(client: any): LogisticsProjectBaseClient {
       return { items: (data.items ?? []).map((item: any) => ({ recordId: String(item.record_id), fields: item.fields ?? {} })), hasMore: data.has_more === true, ...(data.page_token ? { pageToken: String(data.page_token) } : {}) };
     },
     async createTable(input) {
-      const fields = input.fields.map((field: LogisticsProjectBaseFieldSpec) => ({
-        field_name: field.name, type: field.type, ui_type: field.uiType,
-        ...(field.options ? { property: { options: field.options.map(name => ({ name })), multiple: false } } : {}),
-        ...(field.formatter ? { property: { date_formatter: field.formatter } } : {}),
+      const response: any = await call('base_table_create', () => client.request({
+        method: 'POST',
+        url: `/open-apis/base/v3/bases/${encodeURIComponent(input.baseToken)}/tables`,
+        data: { name: input.name, fields: input.fields.map(baseV3FieldForLogisticsProjectBase) },
       }));
-      const data = check(await call('base_table_create', () => client.bitable.appTable.create({ path: { app_token: input.baseToken }, data: { table: { name: input.name, fields } } })), 'base_table_create');
-      if (!data.table_id) throw new Error('base_table_create_missing_table_id');
-      return { tableId: String(data.table_id) };
+      const data = check(response, 'base_table_create');
+      const tableId = data.table_id ?? data.table?.id ?? data.table?.table_id;
+      if (!tableId) throw new Error('base_table_create_missing_table_id');
+      return { tableId: String(tableId) };
     },
     async batchCreate(input) {
       check(await call('base_record_batch_create', () => client.bitable.appTableRecord.batchCreate({ path: { app_token: input.baseToken, table_id: input.tableId }, params: { client_token: input.clientToken }, data: { records: input.records.map((fields: LogisticsProjectBaseFields) => ({ fields })) } })), 'base_record_batch_create');
@@ -120,6 +121,34 @@ function sdkClient(client: any): LogisticsProjectBaseClient {
       check(await call('base_record_batch_update', () => client.bitable.appTableRecord.batchUpdate({ path: { app_token: input.baseToken, table_id: input.tableId }, data: { records: input.records.map(record => ({ record_id: record.recordId, fields: record.fields })) } })), 'base_record_batch_update');
     },
   };
+}
+
+export function baseV3FieldForLogisticsProjectBase(field: LogisticsProjectBaseFieldSpec): Record<string, unknown> {
+  if (field.uiType === 'Text') return { name: field.name, type: 'text' };
+  if (field.uiType === 'SingleSelect') {
+    return {
+      name: field.name,
+      type: 'select',
+      multiple: false,
+      options: field.options?.map(name => ({ name })) ?? [],
+    };
+  }
+  if (field.uiType === 'DateTime') {
+    return {
+      name: field.name,
+      type: 'datetime',
+      ...(field.formatter ? { style: { format: field.formatter } } : {}),
+    };
+  }
+  if (field.uiType === 'Checkbox') return { name: field.name, type: 'checkbox' };
+  if (field.uiType === 'Rating') {
+    return {
+      name: field.name,
+      type: 'number',
+      style: { type: 'rating', icon: 'star', min: 1, max: 5 },
+    };
+  }
+  throw new Error(`logistics_project_base_unsupported_field_type:${field.uiType}`);
 }
 
 export async function projectLogisticsBase(dataDir: string, args: string[]): Promise<void> {

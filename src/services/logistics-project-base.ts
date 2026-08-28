@@ -145,8 +145,24 @@ function normalized(value: unknown): unknown {
   return value ?? null;
 }
 
+function sameFieldValue(expected: unknown, actual: unknown): boolean {
+  const normalizedExpected = normalized(expected);
+  const normalizedActual = normalized(actual);
+  if (
+    (normalizedExpected === '' || normalizedExpected === null)
+    && (normalizedActual === '' || normalizedActual === null)
+  ) return true;
+  if (
+    typeof normalizedExpected === 'number'
+    && typeof normalizedActual === 'string'
+    && normalizedActual.trim() !== ''
+    && Number(normalizedActual) === normalizedExpected
+  ) return true;
+  return JSON.stringify(normalizedActual) === JSON.stringify(normalizedExpected);
+}
+
 function sameFields(expected: LogisticsProjectBaseFields, actual: Record<string, unknown>): boolean {
-  return Object.entries(expected).every(([name, value]) => JSON.stringify(normalized(actual[name])) === JSON.stringify(normalized(value)));
+  return Object.entries(expected).every(([name, value]) => sameFieldValue(value, actual[name]));
 }
 
 export function planLogisticsProjectBase(
@@ -208,6 +224,14 @@ function chunks<T>(items: T[], size = LOGISTICS_PROJECT_BASE_BATCH_SIZE): T[][] 
   return result;
 }
 
+function stableUuidV4(value: string): string {
+  const bytes = createHash('sha256').update(value).digest().subarray(0, 16);
+  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x40;
+  bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function larkErrorCode(error: unknown): number | undefined {
   const object = error as any;
   const values = [object?.code, object?.response?.data?.code, object?.cause?.code];
@@ -257,10 +281,7 @@ export async function runLogisticsProjectBase(input: {
     if (!tableId) tableId = (await input.client.createTable({ baseToken: input.baseToken, name: tableName, fields: LOGISTICS_PROJECT_BASE_FIELDS })).tableId;
     const sleep = input.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
     for (const batch of chunks(plan.create)) {
-      const clientToken = `logistics-project-${createHash('sha256')
-        .update(batch.map(item => item.key).join('\n'))
-        .digest('hex')
-        .slice(0, 32)}`;
+      const clientToken = stableUuidV4(batch.map(item => item.key).join('\n'));
       await retryConflict(() => input.client.batchCreate({
         baseToken: input.baseToken, tableId: tableId!,
         records: batch.map(item => item.fields), clientToken,

@@ -9,6 +9,7 @@ import {
   runLogisticsProjectBase,
   type LogisticsProjectBaseClient,
 } from '../src/services/logistics-project-base.js';
+import { baseV3FieldForLogisticsProjectBase } from '../src/cli/logistics-project-base.js';
 import type { LogisticsProjectBaseSourceRow } from '../src/services/logistics-conversation-store.js';
 
 function row(overrides: Partial<LogisticsProjectBaseSourceRow> = {}): LogisticsProjectBaseSourceRow {
@@ -49,6 +50,27 @@ describe('logistics project Base projection', () => {
     expect(LOGISTICS_PROJECT_BASE_FIELDS.find(field => field.name === '解决状态')?.options).toEqual(['已解决', '处理中', '未知']);
   });
 
+  it('builds Base v3 fields for every projection column', () => {
+    const resolution = LOGISTICS_PROJECT_BASE_FIELDS.find(field => field.name === '解决状态')!;
+    const conversationAt = LOGISTICS_PROJECT_BASE_FIELDS.find(field => field.name === '会话时间')!;
+    const rating = LOGISTICS_PROJECT_BASE_FIELDS.find(field => field.name === '满意度')!;
+    expect(LOGISTICS_PROJECT_BASE_FIELDS.map(baseV3FieldForLogisticsProjectBase)).toHaveLength(21);
+    expect(baseV3FieldForLogisticsProjectBase(resolution)).toEqual({
+      name: '解决状态',
+      type: 'select',
+      multiple: false,
+      options: [{ name: '已解决' }, { name: '处理中' }, { name: '未知' }],
+    });
+    expect(baseV3FieldForLogisticsProjectBase(conversationAt)).toMatchObject({
+      type: 'datetime',
+      style: { format: 'yyyy-MM-dd HH:mm' },
+    });
+    expect(baseV3FieldForLogisticsProjectBase(rating)).toMatchObject({
+      type: 'number',
+      style: { type: 'rating', min: 1, max: 5 },
+    });
+  });
+
   it('plans create/update/unchanged/conflict idempotently', () => {
     const first = row();
     const same = fieldsForLogisticsProjectBase(first, 'Bot');
@@ -64,6 +86,23 @@ describe('logistics project Base projection', () => {
       { recordId: 'rec_dup_2', fields: { 会话唯一键: 'conv_dup' } },
     ], 'Bot');
     expect({ create: plan.create.length, update: plan.update.length, unchanged: plan.unchanged.length, conflict: plan.conflicts.length }).toEqual({ create: 1, update: 1, unchanged: 1, conflict: 1 });
+  });
+
+  it('treats Base empty cells and numeric strings as unchanged', () => {
+    const source = row();
+    delete source.businessCategory;
+    delete source.problemType;
+    delete source.businessReasonCode;
+    delete source.problemReasonCode;
+    delete source.resolutionReasonCode;
+    delete source.harnessRevision;
+    const actual: Record<string, unknown> = fieldsForLogisticsProjectBase(source, 'Bot');
+    for (const name of ['LB', 'LP', '业务 Reason Code', '问题 Reason Code', '解决 Reason Code', '复核原因', 'Harness Revision']) {
+      actual[name] = null;
+    }
+    actual['满意度'] = '5';
+    const plan = planLogisticsProjectBase([source], [{ recordId: 'rec_same', fields: actual }], 'Bot');
+    expect({ update: plan.update.length, unchanged: plan.unchanged.length }).toEqual({ update: 0, unchanged: 1 });
   });
 
   it('reads every page and caps serialized writes at 200 records', async () => {
@@ -84,6 +123,9 @@ describe('logistics project Base projection', () => {
     expect(api.batchCreate).toHaveBeenCalledTimes(2);
     expect((api.batchCreate as any).mock.calls[0][0].records).toHaveLength(200);
     expect((api.batchCreate as any).mock.calls[1][0].records).toHaveLength(1);
+    const tokens = (api.batchCreate as any).mock.calls.map((call: any[]) => call[0].clientToken);
+    expect(tokens.every((token: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(token))).toBe(true);
+    expect(new Set(tokens).size).toBe(2);
   });
 
   it('retries finite Base write conflicts and then recovers', async () => {
@@ -100,5 +142,6 @@ describe('logistics project Base projection', () => {
     expect(waits).toEqual([500, 1_000]);
     const tokens = (api.batchCreate as any).mock.calls.map((call: any[]) => call[0].clientToken);
     expect(new Set(tokens).size).toBe(1);
+    expect(tokens[0]).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   });
 });
