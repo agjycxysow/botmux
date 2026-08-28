@@ -127,6 +127,30 @@ export interface LogisticsConversationListItem {
   updatedAt: number;
 }
 
+export interface LogisticsProjectBaseSourceRow {
+  conversationKey: string;
+  sessionPublicId: string;
+  larkAppId: string;
+  title?: string;
+  conversationAt: number;
+  dataStatus: LogisticsBackfillStatus;
+  captureState?: string;
+  taggingState: string;
+  businessCategory?: string;
+  problemType?: string;
+  resolutionStatus?: string;
+  overallConfidence?: string;
+  needsReview: boolean;
+  reviewReason?: string;
+  harnessRevision?: string;
+  businessReasonCode?: string;
+  problemReasonCode?: string;
+  resolutionReasonCode?: string;
+  rating?: number;
+  surveyStatus?: string;
+  updatedAt: number;
+}
+
 export interface LogisticsConversationDetail extends LogisticsConversationListItem {
   transcript?: string;
   transcriptHash?: string;
@@ -1312,6 +1336,44 @@ export class LogisticsConversationStore {
       ORDER BY session_updated_at DESC,sc.session_key DESC LIMIT ? OFFSET ?
     `).all(...w.params, limit, offset) as any[];
     return { total, items: rows.map(row => this.catalogListItem(row)) };
+  }
+
+  listProjectBaseRows(larkAppId?: string): LogisticsProjectBaseSourceRow[] {
+    const rows = this.db.prepare(`
+      SELECT c.public_id conversation_key,sc.public_id session_public_id,c.lark_app_id,
+        COALESCE(c.title,sc.title) title,sc.created_at conversation_at,
+        sc.backfill_status,c.capture_state,c.tagging_state,c.business_category,c.problem_type,
+        c.resolution_status,c.overall_confidence,c.needs_review,c.review_reason,
+        c.harness_revision,c.business_reason_code,c.problem_reason_code,
+        c.resolution_reason_code,c.rating,c.survey_status,c.updated_at
+      FROM conversations c
+      JOIN session_catalog sc ON sc.lark_app_id=c.lark_app_id AND sc.session_id=c.session_id
+      WHERE (? IS NULL OR c.lark_app_id=?)
+      ORDER BY c.public_id
+    `).all(larkAppId ?? null, larkAppId ?? null) as any[];
+    return rows.map(row => ({
+      conversationKey: String(row.conversation_key),
+      sessionPublicId: String(row.session_public_id),
+      larkAppId: String(row.lark_app_id),
+      ...(row.title ? { title: String(row.title) } : {}),
+      conversationAt: Number(row.conversation_at),
+      dataStatus: String(row.backfill_status ?? 'pending') as LogisticsBackfillStatus,
+      ...(row.capture_state ? { captureState: String(row.capture_state) } : {}),
+      taggingState: String(row.tagging_state ?? 'pending_capture'),
+      ...(row.business_category ? { businessCategory: String(row.business_category) } : {}),
+      ...(row.problem_type ? { problemType: String(row.problem_type) } : {}),
+      ...(row.resolution_status ? { resolutionStatus: String(row.resolution_status) } : {}),
+      ...(row.overall_confidence ? { overallConfidence: String(row.overall_confidence) } : {}),
+      needsReview: bool(row.needs_review),
+      ...(row.review_reason ? { reviewReason: String(row.review_reason) } : {}),
+      ...(row.harness_revision ? { harnessRevision: String(row.harness_revision) } : {}),
+      ...(row.business_reason_code ? { businessReasonCode: String(row.business_reason_code) } : {}),
+      ...(row.problem_reason_code ? { problemReasonCode: String(row.problem_reason_code) } : {}),
+      ...(row.resolution_reason_code ? { resolutionReasonCode: String(row.resolution_reason_code) } : {}),
+      ...(row.rating !== null && row.rating !== undefined ? { rating: Number(row.rating) } : {}),
+      ...(row.survey_status ? { surveyStatus: String(row.survey_status) } : {}),
+      updatedAt: Number(row.updated_at),
+    }));
   }
 
   detail(conversationId: string): LogisticsConversationDetail | undefined {

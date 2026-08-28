@@ -56,6 +56,7 @@ function usage(message?: string): never {
   botmux logistics label [--bot <appId>] [--session <id-prefix>] [--limit N] [--cursor <opaque>] [--concurrency N] [--harness-root <dir>] [--model <id>] [--force] [--apply]
   botmux logistics import-legacy [--bot <appId>]
   botmux logistics import-surveys [--bot <appId>]
+  botmux logistics project-base [--bot <appId>] [--base-token <token>] [--table-name <name>] [--db <path>] [--assume-table-missing] [--apply]
 
 backfill defaults to dry-run. It reads bounded BotMux session metadata; --apply fetches
 visible Lark history and writes sanitized message facts plus bounded snapshots to SQLite.
@@ -934,5 +935,9 @@ export async function runLogisticsConversationCommand(sub: string, args: string[
   if (sub === 'label') return label(dataDir, args);
   if (sub === 'import-legacy') return importLegacy(dataDir, args);
   if (sub === 'import-surveys') return importSurveys(dataDir, args);
+  if (sub === 'project-base') {
+    const { projectLogisticsBase } = await import('./logistics-project-base.js');
+    return projectLogisticsBase(dataDir, args);
+  }
   usage();
 }
