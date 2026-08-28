@@ -232,8 +232,22 @@ describe('logistics captured message facts', () => {
       finalAnswerMessageId: 'om_answer',
       markerHydratedMessageId: 'om_answer',
       messages: [
-        { messageId: 'om_turn', senderType: 'user', content: longContent, createTime: '1000' },
-        { messageId: 'om_answer', senderType: 'app', content: '最终回答', createTime: '2000' },
+        {
+          messageId: 'om_turn',
+          senderType: 'user',
+          senderId: 'ou_sender',
+          senderName: '提问用户',
+          content: longContent,
+          createTime: '1000',
+        },
+        {
+          messageId: 'om_answer',
+          senderType: 'app',
+          senderId: 'cli_bot',
+          senderName: '物流 Bot',
+          content: '最终回答',
+          createTime: '2000',
+        },
       ],
     });
 
@@ -242,6 +256,8 @@ describe('logistics captured message facts', () => {
       role: 'user',
       turnId: 'om_turn',
       occurredAt: 1_000,
+      senderId: 'ou_sender',
+      senderName: '提问用户',
       source: 'lark_history',
     });
     expect(captured[0]!.content).toContain('\n');
@@ -252,6 +268,8 @@ describe('logistics captured message facts', () => {
       turnId: 'om_turn',
       triggerMessageId: 'om_turn',
       responseKind: 'final',
+      senderId: 'cli_bot',
+      senderName: '物流 Bot',
       source: 'botmux_send_marker',
     });
   });

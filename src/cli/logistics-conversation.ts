@@ -53,6 +53,7 @@ function usage(message?: string): never {
   console.error(`Usage:
   botmux logistics sync-catalog [--bot <appId>]
   botmux logistics backfill [--bot <appId>] [--session <id-prefix>] [--since <ISO|YYYY-MM-DD>] [--until <ISO|YYYY-MM-DD>] [--limit N] [--cursor <opaque>] [--apply]
+  botmux logistics backfill-identities [--bot <appId>] [--session <id-prefix>] [--since <ISO|YYYY-MM-DD>] [--until <ISO|YYYY-MM-DD>] [--limit N] [--cursor <opaque>] [--apply]
   botmux logistics label [--bot <appId>] [--session <id-prefix>] [--limit N] [--cursor <opaque>] [--concurrency N] [--harness-root <dir>] [--model <id>] [--force] [--apply]
   botmux logistics import-legacy [--bot <appId>]
   botmux logistics import-surveys [--bot <appId>]
@@ -61,6 +62,9 @@ function usage(message?: string): never {
 backfill defaults to dry-run. It reads bounded BotMux session metadata; --apply fetches
 visible Lark history and writes sanitized message facts plus bounded snapshots to SQLite.
 It never runs semantic labeling.
+
+backfill-identities uses the same bounded history reader but updates only sender,
+participant and initiator identity fields for message facts already stored in SQLite.
 
 label defaults to dry-run. It reads only captured SQLite snapshots and invokes the
 configured read-only Labeling Harness when --apply is present.`);
@@ -352,10 +356,10 @@ export function logisticsSessionCatalogInput(session: Session): LogisticsSession
 
 
 export function mergeLogisticsAnswerPreview(
-  messages: ReadonlyArray<{ messageId: string; senderType?: string; content: string; createTime?: string }>,
+  messages: ReadonlyArray<LogisticsHistoryMessage>,
   answerMessageId: string | undefined,
   marker: LogisticsSendMarker,
-): Array<{ messageId: string; senderType?: string; content: string; createTime?: string }> {
+): LogisticsHistoryMessage[] {
   const preview = marker.previewText?.trim();
   if (!answerMessageId || marker.messageId !== answerMessageId || !preview || preview === 'BOTMUX_NOTHING_TO_SEND') {
     return [...messages];
@@ -389,6 +393,9 @@ export function mergeLogisticsAnswerPreview(
 type LogisticsHistoryMessage = {
   messageId: string;
   senderType?: string;
+  senderId?: string;
+  senderName?: string;
+  senderAvatarUrl?: string;
   content: string;
   createTime?: string;
 };
@@ -426,6 +433,8 @@ async function fetchLogisticsSessionHistory(
         return {
           messageId: parsed.messageId,
           senderType: parsed.senderType,
+          senderId: parsed.senderId,
+          ...(parsed.senderName ? { senderName: parsed.senderName } : {}),
           content: parsed.content,
           createTime: parsed.createTime,
         };
@@ -457,6 +466,8 @@ async function fetchLogisticsSessionHistory(
     return {
       messageId: parsed.messageId,
       senderType: parsed.senderType,
+      senderId: parsed.senderId,
+      ...(parsed.senderName ? { senderName: parsed.senderName } : {}),
       content: parsed.content,
       createTime: parsed.createTime,
     };
@@ -492,6 +503,9 @@ export function buildLogisticsCapturedMessages(input: {
       sessionId: input.sessionId,
       role,
       content,
+      ...(message.senderId ? { senderId: message.senderId } : {}),
+      ...(message.senderName ? { senderName: message.senderName } : {}),
+      ...(message.senderAvatarUrl ? { senderAvatarUrl: message.senderAvatarUrl } : {}),
       ...(message.messageId ? { platformMessageId: message.messageId } : {}),
       ...(occurredAt !== undefined ? { occurredAt } : {}),
       ...(role === 'user' && message.messageId ? { turnId: message.messageId } : {}),
@@ -707,6 +721,91 @@ async function backfill(dataDir: string, args: string[]): Promise<void> {
         });
       }
     }
+  } finally {
+    store.close();
+  }
+  console.log(JSON.stringify(result, null, 2));
+}
+
+async function backfillIdentities(dataDir: string, args: string[]): Promise<void> {
+  const options = parseBackfill(args);
+  const allSessions = [...loadAllSessionsSnapshot({ dataDir }).values()];
+  const page = paginateLogisticsBackfillSessions(allSessions, options);
+  const { sessions } = page;
+  if (!options.apply) {
+    console.log(JSON.stringify({
+      mode: 'dry-run',
+      candidateCount: sessions.length,
+      totalCandidates: page.totalCandidates,
+      hasMore: page.hasMore,
+      nextCursor: page.nextCursor ?? null,
+      candidates: sessions.map(session => ({
+        session: session.sessionId.slice(0, 12),
+        bot: session.larkAppId ?? null,
+        scope: session.scope ?? 'thread',
+        at: sessionTime(session),
+      })),
+    }, null, 2));
+    return;
+  }
+
+  const configs = loadBotConfigs();
+  const sessionApps = [...new Set(
+    sessions.map(session => session.larkAppId).filter((item): item is string => !!item),
+  )];
+  const bot = selectBot(
+    configs,
+    options.bot ?? (sessionApps.length === 1 ? sessionApps[0] : undefined),
+  );
+  registerBot(bot);
+  const store = new LogisticsConversationStore({
+    dataDir,
+    path: bot.logisticsSessionMaster?.sqlite?.path,
+  });
+  store.syncSessionCatalog(allSessions
+    .filter(session => session.larkAppId === bot.larkAppId)
+    .map(logisticsSessionCatalogInput)
+    .filter((row): row is LogisticsSessionCatalogInput => !!row));
+  const result = {
+    mode: 'apply',
+    candidates: sessions.length,
+    totalCandidates: page.totalCandidates,
+    hasMore: page.hasMore,
+    nextCursor: page.nextCursor ?? null,
+    histories: 0,
+    messages: { total: 0, matched: 0, updated: 0 },
+    incomplete: 0,
+    failed: 0,
+    failures: [] as Array<{ session: string; reason: string }>,
+    coverage: store.identityCoverage(bot.larkAppId),
+  };
+  try {
+    for (const session of sessions) {
+      if (session.larkAppId !== bot.larkAppId) continue;
+      try {
+        const history = await fetchLogisticsSessionHistory(session, bot.larkAppId);
+        const capturedMessages = buildLogisticsCapturedMessages({
+          larkAppId: bot.larkAppId,
+          sessionId: session.sessionId,
+          messages: history.messages,
+        });
+        const write = store.upsertCapturedMessageIdentities(capturedMessages);
+        result.histories += 1;
+        result.messages.total += write.total;
+        result.messages.matched += write.matched;
+        result.messages.updated += write.updated;
+        if (!history.complete) result.incomplete += 1;
+      } catch (error) {
+        result.failed += 1;
+        if (result.failures.length < 20) {
+          result.failures.push({
+            session: session.sessionId.slice(0, 12),
+            reason: logisticsBackfillErrorReason(error),
+          });
+        }
+      }
+    }
+    result.coverage = store.identityCoverage(bot.larkAppId);
   } finally {
     store.close();
   }
@@ -932,6 +1031,7 @@ function importLegacy(dataDir: string, args: string[]): void {
 export async function runLogisticsConversationCommand(sub: string, args: string[], dataDir: string): Promise<void> {
   if (sub === 'sync-catalog') return syncCatalog(dataDir, args);
   if (sub === 'backfill') return backfill(dataDir, args);
+  if (sub === 'backfill-identities') return backfillIdentities(dataDir, args);
   if (sub === 'label') return label(dataDir, args);
   if (sub === 'import-legacy') return importLegacy(dataDir, args);
   if (sub === 'import-surveys') return importSurveys(dataDir, args);

@@ -72,7 +72,22 @@ describe('logistics session master', () => {
         transcriptHash: 'd'.repeat(64),
         captureState: 'complete' as const,
         messageCount: 2,
-        messages: [{ role: 'user' as const, content: '问' }, { role: 'assistant' as const, content: '答' }],
+        messages: [
+          {
+            role: 'user' as const,
+            content: '问',
+            messageId: 'om_turn',
+            senderId: 'ou_initiator',
+            senderName: '发起人',
+          },
+          {
+            role: 'assistant' as const,
+            content: '答',
+            messageId: 'om_answer',
+            senderId: 'cli_logistics',
+            senderName: '物流 Bot',
+          },
+        ],
       })),
       runModelTask: vi.fn(async () => ({
         businessCategory: 'LB02', problemType: 'LP01', resolutionStatus: 'resolved' as const,
@@ -90,6 +105,13 @@ describe('logistics session master', () => {
     const { LogisticsConversationStore } = await import('../src/services/logistics-conversation-store.js');
     const store = new LogisticsConversationStore({ dataDir, readOnly: true });
     expect(store.summary()).toMatchObject({ conversations: 1, resolved: 1 });
+    expect(store.identityCoverage()).toMatchObject({
+      conversations: 1,
+      initiators: 1,
+      initiatorNames: 1,
+      messageSenders: 2,
+      participants: 1,
+    });
     store.close();
     manager.stop();
   });

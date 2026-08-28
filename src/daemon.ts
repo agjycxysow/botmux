@@ -21356,6 +21356,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             return {
               messageId: parsed.messageId,
               senderType: parsed.senderType,
+              senderId: parsed.senderId,
+              ...(parsed.senderName ? { senderName: parsed.senderName } : {}),
               content: parsed.content,
               createTime: parsed.createTime,
             };

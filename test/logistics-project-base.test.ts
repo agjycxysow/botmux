@@ -15,6 +15,7 @@ import type { LogisticsProjectBaseSourceRow } from '../src/services/logistics-co
 function row(overrides: Partial<LogisticsProjectBaseSourceRow> = {}): LogisticsProjectBaseSourceRow {
   return {
     conversationKey: 'conv_safe_1', sessionPublicId: 'sess_safe_1', larkAppId: 'cli_bot',
+    initiatorName: '发起人',
     title: '物流问题', conversationAt: 1_000, dataStatus: 'captured', captureState: 'complete',
     taggingState: 'tagged', businessCategory: 'LB02', problemType: 'LP05',
     resolutionStatus: 'resolved', overallConfidence: 'high', needsReview: false,
@@ -41,6 +42,7 @@ describe('logistics project Base projection', () => {
     const fields = fieldsForLogisticsProjectBase(row(), '物流 Bot');
     expect(fields).toMatchObject({
       '会话唯一键': 'conv_safe_1', 'Session 公共 ID': 'sess_safe_1', Bot: '物流 Bot',
+      '会话发起人': '发起人',
       '解决状态': '已解决', LB: 'LB02', LP: 'LP05', needs_review: false,
     });
     expect(Object.keys(fields)).not.toEqual(expect.arrayContaining(['open_id', 'Chat ID', '会话内容', 'Token', 'Cookie']));
@@ -54,7 +56,7 @@ describe('logistics project Base projection', () => {
     const resolution = LOGISTICS_PROJECT_BASE_FIELDS.find(field => field.name === '解决状态')!;
     const conversationAt = LOGISTICS_PROJECT_BASE_FIELDS.find(field => field.name === '会话时间')!;
     const rating = LOGISTICS_PROJECT_BASE_FIELDS.find(field => field.name === '满意度')!;
-    expect(LOGISTICS_PROJECT_BASE_FIELDS.map(baseV3FieldForLogisticsProjectBase)).toHaveLength(21);
+    expect(LOGISTICS_PROJECT_BASE_FIELDS.map(baseV3FieldForLogisticsProjectBase)).toHaveLength(22);
     expect(baseV3FieldForLogisticsProjectBase(resolution)).toEqual({
       name: '解决状态',
       type: 'select',

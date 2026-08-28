@@ -42,8 +42,22 @@ function record(overrides: Partial<LogisticsSessionMasterRecord> = {}): Logistic
     transcriptHash: 'a'.repeat(64),
     captureState: 'complete',
     messages: [
-      { role: 'user', content: '问题', messageId: 'om_turn', createdAt: 1_000 },
-      { role: 'assistant', content: '回答', messageId: 'om_answer', createdAt: 2_000 },
+      {
+        role: 'user',
+        content: '问题',
+        messageId: 'om_turn',
+        createdAt: 1_000,
+        senderId: 'ou_initiator',
+        senderName: '发起人',
+      },
+      {
+        role: 'assistant',
+        content: '回答',
+        messageId: 'om_answer',
+        createdAt: 2_000,
+        senderId: 'cli_logistics',
+        senderName: '物流 Bot',
+      },
     ],
     taggingState: 'tagged',
     businessCategory: 'LB02',
@@ -114,6 +128,17 @@ describe('logistics conversation SQLite store', () => {
       { key: 'LB03', count: 1 },
     ]));
     expect(store.list({ needsReview: true }).items).toHaveLength(1);
+    expect(store.identityCoverage()).toMatchObject({
+      conversations: 2,
+      initiators: 2,
+      initiatorNames: 2,
+      messages: 4,
+      messageSenders: 4,
+      userMessages: 2,
+      userMessageSenders: 2,
+      participants: 2,
+      participantNames: 2,
+    });
     expect(store.list().items[0]).not.toHaveProperty('sessionId');
     expect(store.list().items[0]).not.toHaveProperty('chatId');
     expect(store.detail('oc_chat:session-1')).toBeUndefined();
@@ -160,6 +185,8 @@ describe('logistics conversation SQLite store', () => {
         platformMessageId: 'om_turn',
         role: 'user' as const,
         content: '完整问题\n第二行',
+        senderId: 'ou_initiator',
+        senderName: '发起人',
         occurredAt: 1_000,
         turnId: 'om_turn',
         source: 'lark_history' as const,
@@ -170,6 +197,8 @@ describe('logistics conversation SQLite store', () => {
         platformMessageId: 'om_answer',
         role: 'assistant' as const,
         content: '完整回答',
+        senderId: 'cli_logistics',
+        senderName: '物流 Bot',
         occurredAt: 2_000,
         turnId: 'om_turn',
         triggerMessageId: 'om_turn',
@@ -181,6 +210,11 @@ describe('logistics conversation SQLite store', () => {
       total: 2,
       inserted: 0,
       updated: 2,
+    });
+    expect(store.upsertCapturedMessageIdentities(messages)).toEqual({
+      total: 2,
+      matched: 2,
+      updated: 0,
     });
     expect(store.upsertCapturedMessages(messages)).toEqual({
       total: 2,
@@ -230,6 +264,18 @@ describe('logistics conversation SQLite store', () => {
         { role: 'user', content: '完整问题\n第二行', createdAt: 1_000 },
         { role: 'assistant', content: '完整回答', createdAt: 2_000 },
       ],
+    });
+    expect(store.identityCoverage()).toMatchObject({
+      conversations: 1,
+      initiators: 1,
+      initiatorNames: 1,
+      messages: 2,
+      messageSenders: 2,
+      messageSenderNames: 2,
+      userMessages: 1,
+      userMessageSenders: 1,
+      participants: 1,
+      participantNames: 1,
     });
     store.close();
   });
@@ -359,6 +405,7 @@ describe('logistics conversation SQLite store', () => {
       SELECT snapshot_id FROM conversation_snapshots LIMIT 1
     `).get() as { snapshot_id: string }).snapshot_id);
     legacy.exec(`
+      DROP TABLE conversation_participants;
       DROP TABLE conversation_messages;
       CREATE TABLE conversation_messages (
         snapshot_id TEXT NOT NULL REFERENCES conversation_snapshots(snapshot_id) ON DELETE CASCADE,
@@ -397,11 +444,61 @@ describe('logistics conversation SQLite store', () => {
     migrated.close();
 
     const verified = new DatabaseSync(path, { readOnly: true });
-    expect((verified.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(4);
+    expect((verified.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(5);
     const columns = (verified.prepare('PRAGMA table_info(conversation_messages)').all() as Array<{ name: string }>)
       .map(column => column.name);
     expect(columns).toContain('session_key');
+    expect(columns).toEqual(expect.arrayContaining([
+      'sender_id',
+      'sender_name',
+      'sender_avatar_url',
+    ]));
     expect(columns).not.toContain('snapshot_id');
+    expect((verified.prepare(`
+      SELECT COUNT(*) count FROM conversation_participants
+    `).get() as { count: number }).count).toBe(0);
+    verified.close();
+  });
+
+  it('migrates a v4 database to the three-layer v5 identity schema', async () => {
+    const dataDir = await tempDir();
+    const path = join(dataDir, 'botmux-conversations.sqlite');
+    const initial = new LogisticsConversationStore({ dataDir });
+    initial.upsert(record());
+    initial.close();
+
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      DROP TABLE conversation_participants;
+      ALTER TABLE conversations DROP COLUMN initiator_avatar_url;
+      ALTER TABLE conversations DROP COLUMN initiator_name;
+      ALTER TABLE conversations DROP COLUMN initiator_id;
+      ALTER TABLE conversation_messages DROP COLUMN sender_avatar_url;
+      ALTER TABLE conversation_messages DROP COLUMN sender_name;
+      ALTER TABLE conversation_messages DROP COLUMN sender_id;
+      PRAGMA user_version=4;
+    `);
+    legacy.close();
+
+    const migrated = new LogisticsConversationStore({ dataDir });
+    migrated.close();
+    const verified = new DatabaseSync(path, { readOnly: true });
+    expect((verified.prepare('PRAGMA user_version').get() as { user_version: number }).user_version)
+      .toBe(5);
+    expect((verified.prepare(`
+      SELECT COUNT(*) count
+      FROM pragma_table_info('conversations')
+      WHERE name IN ('initiator_id','initiator_name','initiator_avatar_url')
+    `).get() as { count: number }).count).toBe(3);
+    expect((verified.prepare(`
+      SELECT COUNT(*) count
+      FROM pragma_table_info('conversation_messages')
+      WHERE name IN ('sender_id','sender_name','sender_avatar_url')
+    `).get() as { count: number }).count).toBe(3);
+    expect((verified.prepare(`
+      SELECT COUNT(*) count FROM sqlite_master
+      WHERE type='table' AND name='conversation_participants'
+    `).get() as { count: number }).count).toBe(1);
     verified.close();
   });
 });

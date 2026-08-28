@@ -3,6 +3,9 @@ import { createHash } from 'node:crypto';
 export interface LogisticsSessionMessage {
   messageId: string;
   senderType?: string;
+  senderId?: string;
+  senderName?: string;
+  senderAvatarUrl?: string;
   content: string;
   createTime?: string;
 }
@@ -21,6 +24,9 @@ export interface LogisticsSnapshotMessage {
   content: string;
   messageId?: string;
   createdAt?: number;
+  senderId?: string;
+  senderName?: string;
+  senderAvatarUrl?: string;
 }
 
 export interface BuildLogisticsSessionSnapshotInput {
@@ -118,6 +124,9 @@ export function buildLogisticsSessionSnapshot(
       content,
       ...(message.messageId ? { messageId: message.messageId } : {}),
       ...(Number.isFinite(createdAt) ? { createdAt } : {}),
+      ...(message.senderId ? { senderId: message.senderId } : {}),
+      ...(message.senderName ? { senderName: message.senderName } : {}),
+      ...(message.senderAvatarUrl ? { senderAvatarUrl: message.senderAvatarUrl } : {}),
     } satisfies LogisticsSnapshotMessage];
   });
   const transcript = sanitizeLogisticsSessionText(

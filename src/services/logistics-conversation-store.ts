@@ -14,7 +14,7 @@ import type {
 
 const require = createRequire(import.meta.url);
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const DEFAULT_FILE = 'botmux-conversations.sqlite';
 
 export interface LogisticsConversationStoreOptions {
@@ -37,6 +37,9 @@ export interface LogisticsCapturedMessageInput {
   sessionId: string;
   role: 'user' | 'assistant';
   content: string;
+  senderId?: string;
+  senderName?: string;
+  senderAvatarUrl?: string;
   platformMessageId?: string;
   occurredAt?: number;
   turnId?: string;
@@ -49,6 +52,25 @@ export interface LogisticsCapturedMessageWriteResult {
   total: number;
   inserted: number;
   updated: number;
+}
+
+export interface LogisticsIdentityBackfillWriteResult {
+  total: number;
+  matched: number;
+  updated: number;
+}
+
+export interface LogisticsIdentityCoverage {
+  conversations: number;
+  initiators: number;
+  initiatorNames: number;
+  messages: number;
+  messageSenders: number;
+  messageSenderNames: number;
+  userMessages: number;
+  userMessageSenders: number;
+  participants: number;
+  participantNames: number;
 }
 
 export interface LogisticsLabelRunState {
@@ -131,6 +153,7 @@ export interface LogisticsProjectBaseSourceRow {
   conversationKey: string;
   sessionPublicId: string;
   larkAppId: string;
+  initiatorName?: string;
   title?: string;
   conversationAt: number;
   dataStatus: LogisticsBackfillStatus;
@@ -203,6 +226,12 @@ function safeMetadata(value: string | undefined, maxChars: number): string | nul
     .replace(/\s+/g, ' ')
     .trim();
   return Array.from(sanitized).slice(0, maxChars).join('') || null;
+}
+
+function identityText(value: string | undefined, maxChars: number): string | null {
+  if (!value) return null;
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  return Array.from(normalized).slice(0, maxChars).join('') || null;
 }
 
 function toIsoBoundary(value: string | undefined, end: boolean): number | undefined {
@@ -368,10 +397,75 @@ export class LogisticsConversationStore {
     };
     this.db.exec('BEGIN IMMEDIATE;');
     try {
+      const sessionKeys = new Set<string>();
       for (const message of messages) {
         const outcome = this.upsertCapturedMessageInside(message, capturedAt);
         result[outcome] += 1;
+        sessionKeys.add(`${message.larkAppId}:${message.sessionId}`);
       }
+      for (const sessionKey of sessionKeys) this.refreshConversationInitiatorInside(sessionKey);
+      this.db.exec('COMMIT;');
+      return result;
+    } catch (error) {
+      this.db.exec('ROLLBACK;');
+      throw error;
+    }
+  }
+
+  upsertCapturedMessageIdentities(
+    messages: LogisticsCapturedMessageInput[],
+    capturedAt = Date.now(),
+  ): LogisticsIdentityBackfillWriteResult {
+    const result: LogisticsIdentityBackfillWriteResult = {
+      total: messages.length,
+      matched: 0,
+      updated: 0,
+    };
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const sessionKeys = new Set<string>();
+      for (const message of messages) {
+        if (!message.platformMessageId) continue;
+        const sessionKey = `${message.larkAppId}:${message.sessionId}`;
+        const existing = this.db.prepare(`
+          SELECT role,sender_id,sender_name,sender_avatar_url
+          FROM conversation_messages
+          WHERE session_key=? AND platform_message_id=?
+        `).get(sessionKey, message.platformMessageId) as {
+          role: 'user' | 'assistant';
+          sender_id?: string | null;
+          sender_name?: string | null;
+          sender_avatar_url?: string | null;
+        } | undefined;
+        if (!existing) continue;
+        result.matched += 1;
+        const senderId = identityText(message.senderId, 256);
+        const senderName = identityText(message.senderName, 200);
+        const senderAvatarUrl = identityText(message.senderAvatarUrl, 2_048);
+        const changed = (
+          (senderId !== null && senderId !== existing.sender_id)
+          || (senderName !== null && senderName !== existing.sender_name)
+          || (senderAvatarUrl !== null && senderAvatarUrl !== existing.sender_avatar_url)
+        );
+        if (changed) {
+          this.db.prepare(`
+            UPDATE conversation_messages SET
+              sender_id=COALESCE(?,sender_id),
+              sender_name=COALESCE(?,sender_name),
+              sender_avatar_url=COALESCE(?,sender_avatar_url)
+            WHERE session_key=? AND platform_message_id=?
+          `).run(
+            senderId, senderName, senderAvatarUrl, sessionKey, message.platformMessageId,
+          );
+          result.updated += 1;
+        }
+        this.upsertParticipantFromMessageInside({
+          ...message,
+          role: existing.role,
+        }, capturedAt);
+        sessionKeys.add(sessionKey);
+      }
+      for (const sessionKey of sessionKeys) this.refreshConversationInitiatorInside(sessionKey);
       this.db.exec('COMMIT;');
       return result;
     } catch (error) {
@@ -389,38 +483,113 @@ export class LogisticsConversationStore {
     const contentHash = capturedMessageContentHash(message.content);
     const existing = this.db.prepare(`
       SELECT content_hash,source FROM conversation_messages WHERE message_id=?
-    `).get(messageId) as { content_hash: string; source: LogisticsCapturedMessageInput['source'] } | undefined;
+    `).get(messageId) as {
+      content_hash: string;
+      source: LogisticsCapturedMessageInput['source'];
+    } | undefined;
     const preserveHigherFidelity = existing
       && capturedMessageSourceRank(existing.source) > capturedMessageSourceRank(message.source);
+    const senderId = identityText(message.senderId, 256);
+    const senderName = identityText(message.senderName, 200);
+    const senderAvatarUrl = identityText(message.senderAvatarUrl, 2_048);
     if (!preserveHigherFidelity) {
       this.db.prepare(`
         INSERT INTO conversation_messages (
-          message_id,session_key,platform_message_id,role,content,content_hash,occurred_at,
+          message_id,session_key,platform_message_id,role,content,content_hash,
+          sender_id,sender_name,sender_avatar_url,occurred_at,
           turn_id,trigger_message_id,response_kind,source,captured_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(message_id) DO UPDATE SET
           role=excluded.role,content=excluded.content,content_hash=excluded.content_hash,
+          sender_id=COALESCE(excluded.sender_id,conversation_messages.sender_id),
+          sender_name=COALESCE(excluded.sender_name,conversation_messages.sender_name),
+          sender_avatar_url=COALESCE(
+            excluded.sender_avatar_url,conversation_messages.sender_avatar_url
+          ),
           occurred_at=excluded.occurred_at,turn_id=excluded.turn_id,
           trigger_message_id=excluded.trigger_message_id,response_kind=excluded.response_kind,
           source=excluded.source,captured_at=excluded.captured_at
       `).run(
         messageId, sessionKey, message.platformMessageId ?? null, message.role,
-        message.content, contentHash, message.occurredAt ?? null, message.turnId ?? null,
+        message.content, contentHash, senderId, senderName, senderAvatarUrl,
+        message.occurredAt ?? null, message.turnId ?? null,
         message.triggerMessageId ?? null, message.responseKind ?? null, message.source, capturedAt,
       );
     } else {
       this.db.prepare(`
         UPDATE conversation_messages
-        SET occurred_at=COALESCE(occurred_at,?),turn_id=COALESCE(turn_id,?),
+        SET sender_id=COALESCE(?,sender_id),sender_name=COALESCE(?,sender_name),
+          sender_avatar_url=COALESCE(?,sender_avatar_url),
+          occurred_at=COALESCE(occurred_at,?),turn_id=COALESCE(turn_id,?),
           trigger_message_id=COALESCE(trigger_message_id,?),
           response_kind=COALESCE(response_kind,?),captured_at=MAX(captured_at,?)
         WHERE message_id=?
       `).run(
-        message.occurredAt ?? null, message.turnId ?? null, message.triggerMessageId ?? null,
+        senderId, senderName, senderAvatarUrl, message.occurredAt ?? null,
+        message.turnId ?? null, message.triggerMessageId ?? null,
         message.responseKind ?? null, capturedAt, messageId,
       );
     }
+    this.upsertParticipantFromMessageInside(message, capturedAt);
     return existing ? 'updated' : 'inserted';
+  }
+
+  private upsertParticipantFromMessageInside(
+    message: LogisticsCapturedMessageInput,
+    capturedAt: number,
+  ): void {
+    if (message.role !== 'user') return;
+    const userId = identityText(message.senderId, 256);
+    if (!userId) return;
+    const seenAt = message.occurredAt ?? capturedAt;
+    this.db.prepare(`
+      INSERT INTO conversation_participants (
+        session_key,user_id,user_name,user_avatar_url,first_seen_at,last_seen_at
+      ) VALUES (?,?,?,?,?,?)
+      ON CONFLICT(session_key,user_id) DO UPDATE SET
+        user_name=COALESCE(excluded.user_name,conversation_participants.user_name),
+        user_avatar_url=COALESCE(
+          excluded.user_avatar_url,conversation_participants.user_avatar_url
+        ),
+        first_seen_at=MIN(conversation_participants.first_seen_at,excluded.first_seen_at),
+        last_seen_at=MAX(conversation_participants.last_seen_at,excluded.last_seen_at)
+    `).run(
+      `${message.larkAppId}:${message.sessionId}`,
+      userId,
+      identityText(message.senderName, 200),
+      identityText(message.senderAvatarUrl, 2_048),
+      seenAt,
+      seenAt,
+    );
+  }
+
+  private refreshConversationInitiatorInside(sessionKey: string): void {
+    const first = this.db.prepare(`
+      SELECT sender_id
+      FROM conversation_messages
+      WHERE session_key=? AND role='user' AND sender_id IS NOT NULL AND sender_id<>''
+      ORDER BY occurred_at IS NULL,occurred_at,message_id
+      LIMIT 1
+    `).get(sessionKey) as { sender_id: string } | undefined;
+    if (!first) return;
+    const participant = this.db.prepare(`
+      SELECT user_name,user_avatar_url
+      FROM conversation_participants
+      WHERE session_key=? AND user_id=?
+    `).get(sessionKey, first.sender_id) as {
+      user_name?: string | null;
+      user_avatar_url?: string | null;
+    } | undefined;
+    this.db.prepare(`
+      UPDATE conversations SET
+        initiator_id=?,initiator_name=?,initiator_avatar_url=?
+      WHERE lark_app_id || ':' || session_id=?
+    `).run(
+      first.sender_id,
+      participant?.user_name ?? null,
+      participant?.user_avatar_url ?? null,
+      sessionKey,
+    );
   }
 
   private insertCatalogRow(row: LogisticsSessionCatalogInput): { changes?: number | bigint } {
@@ -519,6 +688,9 @@ export class LogisticsConversationStore {
           chat_id TEXT NOT NULL,
           root_message_id TEXT,
           respondent_subject_hash TEXT,
+          initiator_id TEXT,
+          initiator_name TEXT,
+          initiator_avatar_url TEXT,
           title TEXT,
           recap TEXT,
           answer_message_id TEXT,
@@ -601,6 +773,7 @@ export class LogisticsConversationStore {
           UNIQUE(master_key, transcript_hash, harness_revision)
         );
       `);
+      this.createConversationParticipantsTable();
       if (version < 4) {
         this.migrateConversationMessagesToFacts();
         this.db.exec(`
@@ -610,12 +783,28 @@ export class LogisticsConversationStore {
         `);
       }
       this.createConversationMessagesTable();
+      if (version < 5) {
+        this.addColumnIfMissing('conversations', 'initiator_id', 'TEXT');
+        this.addColumnIfMissing('conversations', 'initiator_name', 'TEXT');
+        this.addColumnIfMissing('conversations', 'initiator_avatar_url', 'TEXT');
+        this.addColumnIfMissing('conversation_messages', 'sender_id', 'TEXT');
+        this.addColumnIfMissing('conversation_messages', 'sender_name', 'TEXT');
+        this.addColumnIfMissing('conversation_messages', 'sender_avatar_url', 'TEXT');
+      }
       this.db.exec(`PRAGMA user_version=${SCHEMA_VERSION};`);
       this.db.exec('COMMIT;');
     } catch (error) {
       this.db.exec('ROLLBACK;');
       throw error;
     }
+  }
+
+  private addColumnIfMissing(table: string, column: string, type: string): void {
+    const columns = new Set(
+      (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+        .map(item => item.name),
+    );
+    if (!columns.has(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type};`);
   }
 
   private createConversationMessagesTable(): void {
@@ -627,6 +816,9 @@ export class LogisticsConversationStore {
         role TEXT NOT NULL CHECK(role IN ('user','assistant')),
         content TEXT NOT NULL,
         content_hash TEXT NOT NULL,
+        sender_id TEXT,
+        sender_name TEXT,
+        sender_avatar_url TEXT,
         occurred_at INTEGER,
         turn_id TEXT,
         trigger_message_id TEXT,
@@ -639,6 +831,22 @@ export class LogisticsConversationStore {
         WHERE platform_message_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS conversation_messages_session_time
         ON conversation_messages(session_key,occurred_at,message_id);
+    `);
+  }
+
+  private createConversationParticipantsTable(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS conversation_participants (
+        session_key TEXT NOT NULL REFERENCES session_catalog(session_key) ON DELETE CASCADE,
+        user_id TEXT NOT NULL,
+        user_name TEXT,
+        user_avatar_url TEXT,
+        first_seen_at INTEGER NOT NULL,
+        last_seen_at INTEGER NOT NULL,
+        PRIMARY KEY(session_key,user_id)
+      );
+      CREATE INDEX IF NOT EXISTS conversation_participants_session_seen
+        ON conversation_participants(session_key,first_seen_at,user_id);
     `);
   }
 
@@ -766,6 +974,9 @@ export class LogisticsConversationStore {
             sessionId: record.sessionId,
             role: message.role,
             content: message.content,
+            ...(message.senderId ? { senderId: message.senderId } : {}),
+            ...(message.senderName ? { senderName: message.senderName } : {}),
+            ...(message.senderAvatarUrl ? { senderAvatarUrl: message.senderAvatarUrl } : {}),
             ...(message.messageId ? { platformMessageId: message.messageId } : {}),
             ...(message.createdAt ? { occurredAt: message.createdAt } : {}),
             turnId: message.role === 'user' && message.messageId ? message.messageId : record.turnId,
@@ -793,6 +1004,7 @@ export class LogisticsConversationStore {
             record.manualReviewStatus ?? 'pending', record.updatedAt);
         }
       }
+      this.refreshConversationInitiatorInside(`${record.larkAppId}:${record.sessionId}`);
       this.db.exec('COMMIT;');
     } catch (error) {
       this.db.exec('ROLLBACK;');
@@ -873,6 +1085,7 @@ export class LogisticsConversationStore {
         undefined,
         conversationId,
       );
+      this.refreshConversationInitiatorInside(`${record.larkAppId}:${record.sessionId}`);
       this.db.exec('COMMIT;');
     } catch (error) {
       this.db.exec('ROLLBACK;');
@@ -1341,7 +1554,7 @@ export class LogisticsConversationStore {
   listProjectBaseRows(larkAppId?: string): LogisticsProjectBaseSourceRow[] {
     const rows = this.db.prepare(`
       SELECT c.public_id conversation_key,sc.public_id session_public_id,c.lark_app_id,
-        COALESCE(c.title,sc.title) title,sc.created_at conversation_at,
+        c.initiator_name,COALESCE(c.title,sc.title) title,sc.created_at conversation_at,
         sc.backfill_status,c.capture_state,c.tagging_state,c.business_category,c.problem_type,
         c.resolution_status,c.overall_confidence,c.needs_review,c.review_reason,
         c.harness_revision,c.business_reason_code,c.problem_reason_code,
@@ -1355,6 +1568,7 @@ export class LogisticsConversationStore {
       conversationKey: String(row.conversation_key),
       sessionPublicId: String(row.session_public_id),
       larkAppId: String(row.lark_app_id),
+      ...(row.initiator_name ? { initiatorName: String(row.initiator_name) } : {}),
       ...(row.title ? { title: String(row.title) } : {}),
       conversationAt: Number(row.conversation_at),
       dataStatus: String(row.backfill_status ?? 'pending') as LogisticsBackfillStatus,
@@ -1374,6 +1588,46 @@ export class LogisticsConversationStore {
       ...(row.survey_status ? { surveyStatus: String(row.survey_status) } : {}),
       updatedAt: Number(row.updated_at),
     }));
+  }
+
+  identityCoverage(larkAppId?: string): LogisticsIdentityCoverage {
+    const conversation = this.db.prepare(`
+      SELECT COUNT(*) conversations,
+        COALESCE(SUM(initiator_id IS NOT NULL AND initiator_id<>''),0) initiators,
+        COALESCE(SUM(initiator_name IS NOT NULL AND initiator_name<>''),0) initiator_names
+      FROM conversations
+      WHERE (? IS NULL OR lark_app_id=?)
+    `).get(larkAppId ?? null, larkAppId ?? null) as any;
+    const message = this.db.prepare(`
+      SELECT COUNT(*) messages,
+        COALESCE(SUM(cm.sender_id IS NOT NULL AND cm.sender_id<>''),0) message_senders,
+        COALESCE(SUM(cm.sender_name IS NOT NULL AND cm.sender_name<>''),0) message_sender_names,
+        COALESCE(SUM(cm.role='user'),0) user_messages,
+        COALESCE(SUM(cm.role='user' AND cm.sender_id IS NOT NULL AND cm.sender_id<>''),0)
+          user_message_senders
+      FROM conversation_messages cm
+      JOIN session_catalog sc ON sc.session_key=cm.session_key
+      WHERE (? IS NULL OR sc.lark_app_id=?)
+    `).get(larkAppId ?? null, larkAppId ?? null) as any;
+    const participant = this.db.prepare(`
+      SELECT COUNT(*) participants,
+        COALESCE(SUM(cp.user_name IS NOT NULL AND cp.user_name<>''),0) participant_names
+      FROM conversation_participants cp
+      JOIN session_catalog sc ON sc.session_key=cp.session_key
+      WHERE (? IS NULL OR sc.lark_app_id=?)
+    `).get(larkAppId ?? null, larkAppId ?? null) as any;
+    return {
+      conversations: Number(conversation.conversations ?? 0),
+      initiators: Number(conversation.initiators ?? 0),
+      initiatorNames: Number(conversation.initiator_names ?? 0),
+      messages: Number(message.messages ?? 0),
+      messageSenders: Number(message.message_senders ?? 0),
+      messageSenderNames: Number(message.message_sender_names ?? 0),
+      userMessages: Number(message.user_messages ?? 0),
+      userMessageSenders: Number(message.user_message_senders ?? 0),
+      participants: Number(participant.participants ?? 0),
+      participantNames: Number(participant.participant_names ?? 0),
+    };
   }
 
   detail(conversationId: string): LogisticsConversationDetail | undefined {
