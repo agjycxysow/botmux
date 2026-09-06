@@ -19,6 +19,7 @@ import {
   canPreferLogisticsRecoveryMessage,
   computeLogisticsAnalysisContentHash,
   isLogisticsPlaceholderContent,
+  isTrustedLogisticsRecoveryMessage,
   type LogisticsAnalysisCaptureStatus,
   type LogisticsAnalysisMessage,
   type LogisticsAnalysisMessageInput,
@@ -937,6 +938,50 @@ function canonicalSourceMessages(
   };
 }
 
+function mergeTrustedCandidateRecoveries(
+  sourceMessages: ReadonlyArray<LogisticsAnalysisMessageInput>,
+  candidateMessages: ReadonlyArray<LogisticsAnalysisMessage>,
+): LogisticsAnalysisMessageInput[] {
+  const trusted = new Map<string, LogisticsAnalysisMessage>();
+  for (const candidate of candidateMessages) {
+    const platformMessageId = candidate.platformMessageId?.trim();
+    if (!platformMessageId) continue;
+    const input = {
+      role: candidate.role,
+      source: candidate.source,
+      ...(candidate.responseKind ? { responseKind: candidate.responseKind } : {}),
+      content: candidate.content,
+    } as const;
+    if (isTrustedLogisticsRecoveryMessage(input) && !trusted.has(platformMessageId)) {
+      trusted.set(platformMessageId, candidate);
+    }
+  }
+  return sourceMessages.map(source => {
+    const platformMessageId = source.platformMessageId?.trim();
+    const candidate = platformMessageId ? trusted.get(platformMessageId) : undefined;
+    if (!candidate) return source;
+    const candidateInput = {
+      role: candidate.role,
+      source: candidate.source,
+      responseKind: 'final' as const,
+      content: candidate.content,
+    };
+    const sourceInput = {
+      role: source.role,
+      source: source.source,
+      ...(source.responseKind ? { responseKind: source.responseKind } : {}),
+      content: source.content,
+    } as const;
+    if (!canPreferLogisticsRecoveryMessage(candidateInput, sourceInput)) return source;
+    return {
+      ...source,
+      content: candidate.content,
+      source: candidate.source,
+      responseKind: 'final' as const,
+    };
+  });
+}
+
 function sourceSessionFingerprint(group: TopicGroup): string {
   return createHash('sha256').update(JSON.stringify(group.sessions.map(session => ({
     sessionId: session.sessionId,
@@ -1336,7 +1381,10 @@ async function labelPageWithStore(
         result.failures.push({ topicPublicId: buildLogisticsTopicPublicId(candidate.sessionKey), code: 'source_history_not_stable' });
         continue;
       }
-      const beforeMessages = await buildAnalysisMessages(ctx, group, before);
+      const beforeMessages = mergeTrustedCandidateRecoveries(
+        await buildAnalysisMessages(ctx, group, before),
+        candidate.messages,
+      );
       const beforeCanonical = canonicalSourceMessages(beforeMessages);
       if (!beforeCanonical.reliable || beforeCanonical.conflicted
         || beforeCanonical.hash !== candidate.contentHash) {
@@ -1443,7 +1491,10 @@ async function labelPageWithStore(
         result.failures.push({ topicPublicId: buildLogisticsTopicPublicId(candidate.sessionKey), code: 'source_history_not_stable_before_commit' });
         continue;
       }
-      const afterMessages = await buildAnalysisMessages(ctx, afterGroup!, after);
+      const afterMessages = mergeTrustedCandidateRecoveries(
+        await buildAnalysisMessages(ctx, afterGroup!, after),
+        candidate.messages,
+      );
       const afterCanonical = canonicalSourceMessages(afterMessages);
       const afterGate = await checkLogisticsAnalysisLabelGate(
         { dataDir: ctx.options.dataDir, botId: ctx.options.bot.larkAppId, now: ctx.now(), group: afterGroup! },
