@@ -173,7 +173,7 @@ describe('logistics conversation SQLite store', () => {
     store.close();
   });
 
-  it('stores message facts idempotently and capture-only updates preserve labels and ratings', async () => {
+  it('stores message facts idempotently and invalidates stale labels when the transcript changes', async () => {
     const dataDir = await tempDir();
     const store = new LogisticsConversationStore({ dataDir });
     store.upsert(record());
@@ -244,22 +244,25 @@ describe('logistics conversation SQLite store', () => {
     expect(store.summary()).toMatchObject({
       conversations: 1,
       messages: 2,
-      labeled: 1,
-      resolved: 1,
+      labeled: 0,
+      resolved: 0,
+      needsReview: 1,
     });
     expect(store.list({ dataStatus: 'captured' })).toMatchObject({
       total: 1,
       items: [expect.objectContaining({
         rating: 5,
-        businessCategory: 'LB02',
-        problemType: 'LP05',
-        resolutionStatus: 'resolved',
+        taggingState: 'needs_review',
+        needsReview: true,
+        reviewReason: '会话内容已更新，需重新打标',
         dataStatus: 'captured',
         messageCount: 2,
       })],
     });
     expect(store.detail('conv_21c9e882b55ee6e94b898e21d3ce80d5')).toMatchObject({
-      harnessRevision: 'b'.repeat(64),
+      rating: 5,
+      taggingState: 'needs_review',
+      needsReview: true,
       messages: [
         { role: 'user', content: '完整问题\n第二行', createdAt: 1_000 },
         { role: 'assistant', content: '完整回答', createdAt: 2_000 },
@@ -278,6 +281,21 @@ describe('logistics conversation SQLite store', () => {
       participantNames: 1,
     });
     store.close();
+
+    const verified = new DatabaseSync(join(dataDir, 'botmux-conversations.sqlite'), { readOnly: true });
+    expect((verified.prepare(`
+      SELECT COUNT(*) count FROM conversation_labels
+    `).get() as { count: number }).count).toBe(1);
+    expect((verified.prepare(`
+      SELECT business_category,problem_type,resolution_status,harness_revision
+      FROM conversations
+    `).get() as Record<string, unknown>)).toEqual({
+      business_category: null,
+      problem_type: null,
+      resolution_status: null,
+      harness_revision: null,
+    });
+    verified.close();
   });
 
   it('rebuilds labeling inputs and commits label projections with auditable retries', async () => {

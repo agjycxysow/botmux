@@ -1229,7 +1229,7 @@ export interface BotConfig {
   feedbackWebhooks?: { destinations: FeedbackWebhookDestination[] };
   /** Delayed post-turn survey. Missing or disabled stays inert. */
   feedbackSurvey?: FeedbackSurveyConfig;
-  /** Logistics session master row, triggered only after a survey card is sent. */
+  /** Offline logistics conversation capture, labeling, and projection config. */
   logisticsSessionMaster?: LogisticsSessionMasterConfig;
   /**
    * 租户品牌：`'feishu'`（中国版，open.feishu.cn）或 `'lark'`（国际版，

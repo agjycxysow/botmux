@@ -1,14 +1,15 @@
 # Logistics conversation analytics MVP
 
 This feature builds a local SQLite fact store for logistics-expert sessions,
-messages, satisfaction, and semantic labels, plus a standalone read-only
-internal site. It deliberately does not add a BotMux Dashboard page.
+messages, and semantic labels, plus a standalone read-only internal site. It
+deliberately does not add a BotMux Dashboard page.
 
 ## Runtime flow
 
 ```text
 BotMux session catalog
-  -> botmux logistics backfill
+  -> botmux logistics sync-catalog
+  -> botmux logistics backfill --apply
   -> complete visible Lark history + BotMux send marker
   -> sanitized message facts
   -> bounded 12,000-character snapshot when turn/final boundaries exist
@@ -24,9 +25,10 @@ Nginx / internal domain
   -> SQLite read-only
 ```
 
-The live writer and the analytics reader share one host. BotMux is the only
-writer. SQLite WAL permits the read-only service to query while the daemon keeps
-writing.
+SQLite is updated only by explicit offline CLI commands. The BotMux daemon does
+not capture, label, or project logistics conversations while serving messages.
+A cron job may schedule the idempotent offline commands; the analytics server
+continues to read SQLite in read-only mode.
 
 ## Privacy boundary
 
@@ -41,6 +43,9 @@ writing.
   endpoint.
 
 ## Operations
+
+`botmux logistics sync-catalog` reconciles BotMux Session metadata into SQLite.
+Run it before `backfill` so the capture command sees the complete Session set.
 
 `botmux logistics backfill` is a capture-only command and is dry-run by default.
 It never invokes the labeling Harness or a model. `--apply` is bounded by bot,
@@ -93,5 +98,5 @@ Production rollout should add approved internal SSO and HTTPS at the Nginx / dom
 layer; the token is a narrow MVP guard, not a long-term identity system.
 
 SQLite backup must include a consistent WAL checkpoint or use an online backup
-mechanism. Monitor database/WAL size, disk space, `/healthz`, and
-`[logistics-session-master] SQLite sync failed` logs.
+mechanism. Monitor database/WAL size, disk space, `/healthz`, cron exit status,
+and the catalog capture-status distribution.

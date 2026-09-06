@@ -45,7 +45,12 @@ export interface LogisticsCapturedMessageInput {
   turnId?: string;
   triggerMessageId?: string;
   responseKind?: 'final';
-  source: 'lark_history' | 'botmux_send_marker' | 'snapshot_projection' | 'legacy_snapshot';
+  source:
+    | 'lark_history'
+    | 'botmux_send_marker'
+    | 'codex_rollout'
+    | 'snapshot_projection'
+    | 'legacy_snapshot';
 }
 
 export interface LogisticsCapturedMessageWriteResult {
@@ -305,6 +310,7 @@ function capturedMessageContentHash(content: string): string {
 }
 
 function capturedMessageSourceRank(source: LogisticsCapturedMessageInput['source']): number {
+  if (source === 'codex_rollout') return 4;
   if (source === 'botmux_send_marker') return 3;
   if (source === 'lark_history') return 2;
   return 1;
@@ -1027,24 +1033,56 @@ export class LogisticsConversationStore {
         lastMessageAt: record.updatedAt,
       });
       const existing = this.db.prepare(`
-        SELECT master_key FROM conversations WHERE lark_app_id=? AND session_id=?
-      `).get(record.larkAppId, record.sessionId) as { master_key: string } | undefined;
+        SELECT master_key,transcript_hash
+        FROM conversations
+        WHERE lark_app_id=? AND session_id=?
+      `).get(record.larkAppId, record.sessionId) as {
+        master_key: string;
+        transcript_hash?: string | null;
+      } | undefined;
       const masterKey = existing?.master_key ?? record.masterKey;
       if (existing) {
+        const transcriptChanged = Boolean(
+          existing.transcript_hash
+          && record.transcriptHash
+          && existing.transcript_hash !== record.transcriptHash,
+        );
+        const invalidateProjection = transcriptChanged ? 1 : 0;
         this.db.prepare(`
           UPDATE conversations SET
             turn_id=?,chat_id=?,root_message_id=?,title=?,answer_message_id=?,
             capture_state=?,transcript=?,transcript_hash=?,message_count=?,
             review_reason=CASE
+              WHEN ? THEN ?
               WHEN review_reason IS NULL OR review_reason='' THEN ?
               ELSE review_reason
             END,
+            tagging_state=CASE WHEN ? THEN 'needs_review' ELSE tagging_state END,
+            business_category=CASE WHEN ? THEN NULL ELSE business_category END,
+            problem_type=CASE WHEN ? THEN NULL ELSE problem_type END,
+            resolution_status=CASE WHEN ? THEN NULL ELSE resolution_status END,
+            overall_confidence=CASE WHEN ? THEN NULL ELSE overall_confidence END,
+            needs_review=CASE WHEN ? THEN 1 ELSE needs_review END,
+            harness_revision=CASE WHEN ? THEN NULL ELSE harness_revision END,
+            business_reason_code=CASE WHEN ? THEN NULL ELSE business_reason_code END,
+            problem_reason_code=CASE WHEN ? THEN NULL ELSE problem_reason_code END,
+            resolution_reason_code=CASE WHEN ? THEN NULL ELSE resolution_reason_code END,
+            evidence_anchors_json=CASE WHEN ? THEN NULL ELSE evidence_anchors_json END,
+            manual_review_status=CASE WHEN ? THEN 'pending' ELSE manual_review_status END,
+            model_attempts=CASE WHEN ? THEN 0 ELSE model_attempts END,
+            model_error=CASE WHEN ? THEN NULL ELSE model_error END,
             updated_at=MAX(updated_at,?)
           WHERE master_key=?
         `).run(
           record.turnId, record.chatId, record.rootMessageId, safeMetadata(record.title, 120),
           record.answerMessageId ?? null, record.captureState ?? null, record.transcript ?? null,
-          record.transcriptHash ?? null, fullMessageCount, safeMetadata(record.reviewReason, 500),
+          record.transcriptHash ?? null, fullMessageCount,
+          invalidateProjection, '会话内容已更新，需重新打标',
+          safeMetadata(record.reviewReason, 500),
+          invalidateProjection, invalidateProjection, invalidateProjection, invalidateProjection,
+          invalidateProjection, invalidateProjection, invalidateProjection, invalidateProjection,
+          invalidateProjection, invalidateProjection, invalidateProjection, invalidateProjection,
+          invalidateProjection, invalidateProjection,
           record.updatedAt, masterKey,
         );
       } else {

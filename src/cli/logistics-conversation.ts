@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { loadBotConfigs, registerBot, type BotConfig } from '../bot-registry.js';
 import { listChatMessagesUntil, listThreadMessages } from '../im/lark/client.js';
 import { parseApiMessage } from '../im/lark/message-parser.js';
+import { resolveLogisticsCodexAnswer } from '../services/logistics-codex-answer.js';
 import {
   buildLogisticsSessionSnapshot,
   sanitizeLogisticsMessageText,
@@ -26,6 +27,7 @@ import {
 import { loadAllSessionsSnapshot } from '../services/session-store.js';
 import type { Session } from '../types.js';
 
+import { runLogisticsAnalysisCommand } from './logistics-analysis-collection.js';
 interface BackfillOptions {
   apply: boolean;
   bot?: string;
@@ -51,6 +53,7 @@ interface LabelOptions {
 function usage(message?: string): never {
   if (message) console.error(message);
   console.error(`Usage:
+  botmux logistics analysis sync-catalog|capture|label|run|migrate [options]
   botmux logistics sync-catalog [--bot <appId>]
   botmux logistics backfill [--bot <appId>] [--session <id-prefix>] [--since <ISO|YYYY-MM-DD>] [--until <ISO|YYYY-MM-DD>] [--limit N] [--cursor <opaque>] [--apply]
   botmux logistics backfill-identities [--bot <appId>] [--session <id-prefix>] [--since <ISO|YYYY-MM-DD>] [--until <ISO|YYYY-MM-DD>] [--limit N] [--cursor <opaque>] [--apply]
@@ -157,6 +160,7 @@ interface LogisticsSendMarker {
   sentAtMs?: number;
   previewText?: string;
   contentLength?: number;
+  authoritative?: boolean;
 }
 
 function latestSendMarker(dataDir: string, sessionId: string): LogisticsSendMarker {
@@ -381,10 +385,10 @@ export function mergeLogisticsAnswerPreview(
     });
   }
   const current = messages[index]!.content.trim();
-  const nonTerminal = /\[卡片:|工作中|等待输入|显示输出|打开(?:可操作 )?Web 终端|Ask Codex|BOTMUX_NOTHING_TO_SEND/i.test(current);
+  const nonTerminal = /\[卡片:|\[图片\]请升级至最新版本客户端，以查看内容|工作中|等待输入|显示输出|打开(?:可操作 )?Web 终端|Ask Codex|BOTMUX_NOTHING_TO_SEND/i.test(current);
   const previewIsRicher = preview.length >= Math.max(20, current.length * 1.2)
     || (marker.contentLength !== undefined && marker.contentLength > current.length);
-  if (!nonTerminal && !previewIsRicher) return [...messages];
+  if (!marker.authoritative && !nonTerminal && !previewIsRicher) return [...messages];
   return messages.map((message, messageIndex) => messageIndex === index
     ? { ...message, senderType: 'app', content: preview }
     : { ...message });
@@ -485,7 +489,7 @@ export function buildLogisticsCapturedMessages(input: {
   sessionId: string;
   messages: ReadonlyArray<LogisticsHistoryMessage>;
   finalAnswerMessageId?: string;
-  markerHydratedMessageId?: string;
+  finalAnswerSource?: LogisticsCapturedMessageInput['source'];
 }): LogisticsCapturedMessageInput[] {
   let latestUserMessageId: string | undefined;
   return input.messages.flatMap(message => {
@@ -515,9 +519,9 @@ export function buildLogisticsCapturedMessages(input: {
       ...(message.messageId === input.finalAnswerMessageId
         ? { responseKind: 'final' as const }
         : {}),
-      source: message.messageId === input.markerHydratedMessageId
-        ? 'botmux_send_marker' as const
-        : 'lark_history' as const,
+      source: message.messageId === input.finalAnswerMessageId && input.finalAnswerSource
+        ? input.finalAnswerSource
+        : 'lark_history',
     }];
   });
 }
@@ -606,6 +610,13 @@ async function backfill(dataDir: string, args: string[]): Promise<void> {
     nextCursor: page.nextCursor ?? null,
     captured: 0,
     messages: { total: 0, inserted: 0, updated: 0 },
+    answerSources: {
+      lark_history: 0,
+      botmux_send_marker: 0,
+      codex_botmux_send: 0,
+      codex_botmux_send_time_match: 0,
+      codex_assistant_final: 0,
+    } as Record<string, number>,
     statuses: {} as Record<string, number>,
     failed: 0,
     failures: [] as Array<{ session: string; reason: string }>,
@@ -624,24 +635,69 @@ async function backfill(dataDir: string, args: string[]): Promise<void> {
       store.markSessionBackfill(bot.larkAppId, session.sessionId, 'processing');
       try {
         const history = await fetchLogisticsSessionHistory(session, bot.larkAppId);
-        const hydratedMessages = mergeLogisticsAnswerPreview(
+        let hydratedMessages = mergeLogisticsAnswerPreview(
           history.messages,
           marker.messageId,
           marker,
         );
-        const boundary = inferLogisticsBackfillBoundaries(
+        let boundary = inferLogisticsBackfillBoundaries(
           hydratedMessages,
           session.quoteTargetId ?? (session.rootMessageId.startsWith('om_') ? session.rootMessageId : undefined),
           marker.messageId,
         );
+        const expectedTurn = boundary.turnId
+          ? hydratedMessages.find(message => message.messageId === boundary.turnId)
+          : undefined;
+        const expectedAnswer = boundary.answerMessageId
+          ? hydratedMessages.find(message => message.messageId === boundary.answerMessageId)
+          : undefined;
+        const expectedAnswerAtMs = marker.sentAtMs ?? historyMessageTime(expectedAnswer ?? {});
+        const recovered = resolveLogisticsCodexAnswer(session, {
+          ...(marker.messageId ? { markerMessageId: marker.messageId } : {}),
+          ...(expectedTurn?.content ? { expectedUserText: expectedTurn.content } : {}),
+          ...(expectedAnswerAtMs !== undefined ? { expectedAnswerAtMs } : {}),
+        });
+        let finalAnswerSource: LogisticsCapturedMessageInput['source'] | undefined;
+        let answerSource = 'lark_history';
+        if (recovered && boundary.answerMessageId) {
+          hydratedMessages = mergeLogisticsAnswerPreview(
+            hydratedMessages,
+            boundary.answerMessageId,
+            {
+              messageId: boundary.answerMessageId,
+              sentAtMs: recovered.occurredAt,
+              previewText: recovered.content,
+              contentLength: recovered.content.length,
+              authoritative: recovered.source === 'codex_botmux_send',
+            },
+          );
+          boundary = inferLogisticsBackfillBoundaries(
+            hydratedMessages,
+            boundary.turnId,
+            boundary.answerMessageId,
+          );
+          const recoveredMessage = hydratedMessages.find(
+            message => message.messageId === boundary.answerMessageId,
+          );
+          if (recoveredMessage?.content.trim() === recovered.content.trim()) {
+            finalAnswerSource = 'codex_rollout';
+            answerSource = recovered.source;
+          }
+        }
+        if (!finalAnswerSource && marker.messageId && marker.previewText?.trim()) {
+          const markerMessage = hydratedMessages.find(message => message.messageId === marker.messageId);
+          if (markerMessage?.content.trim() === marker.previewText.trim()) {
+            finalAnswerSource = 'botmux_send_marker';
+            answerSource = 'botmux_send_marker';
+          }
+        }
+        result.answerSources[answerSource] = (result.answerSources[answerSource] ?? 0) + 1;
         const capturedMessages = buildLogisticsCapturedMessages({
           larkAppId: bot.larkAppId,
           sessionId: session.sessionId,
           messages: hydratedMessages,
           finalAnswerMessageId: boundary.answerMessageId,
-          ...(marker.messageId && marker.previewText?.trim()
-            ? { markerHydratedMessageId: marker.messageId }
-            : {}),
+          ...(finalAnswerSource ? { finalAnswerSource } : {}),
         });
         const write = store.upsertCapturedMessages(capturedMessages);
         result.messages.total += write.total;
@@ -1029,6 +1085,7 @@ function importLegacy(dataDir: string, args: string[]): void {
 }
 
 export async function runLogisticsConversationCommand(sub: string, args: string[], dataDir: string): Promise<void> {
+  if (sub === 'analysis') return runLogisticsAnalysisCommand(args[0] ?? '', args.slice(1), dataDir);
   if (sub === 'sync-catalog') return syncCatalog(dataDir, args);
   if (sub === 'backfill') return backfill(dataDir, args);
   if (sub === 'backfill-identities') return backfillIdentities(dataDir, args);

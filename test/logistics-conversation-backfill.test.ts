@@ -177,7 +177,7 @@ describe('logistics answer preview hydration', () => {
   it('replaces a non-terminal card placeholder with the delivered final text', async () => {
     expect(mergeLogisticsAnswerPreview([
       { messageId: 'om_turn', senderType: 'user', content: '帮我定位问题' },
-      { messageId: 'om_answer', senderType: 'app', content: '[卡片: Codex 工作中]' },
+      { messageId: 'om_answer', senderType: 'app', content: '[图片]请升级至最新版本客户端，以查看内容' },
     ], 'om_answer', {
       messageId: 'om_answer', contentLength: 48,
       previewText: '结论：问题已经定位，并给出了可核验的修复路径。',
@@ -230,7 +230,7 @@ describe('logistics captured message facts', () => {
       larkAppId: 'cli_logistics',
       sessionId: 'session-1',
       finalAnswerMessageId: 'om_answer',
-      markerHydratedMessageId: 'om_answer',
+      finalAnswerSource: 'botmux_send_marker',
       messages: [
         {
           messageId: 'om_turn',
