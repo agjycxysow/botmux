@@ -1,12 +1,19 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
+import { resolveLogisticsHarnessRevision } from '../services/logistics-session-model-task.js';
 import {
-  LogisticsConversationStore,
-  type LogisticsConversationFilters,
-} from '../services/logistics-conversation-store.js';
+  LogisticsAnalysisStore,
+  type LogisticsAnalysisCaptureStatus,
+  type LogisticsAnalysisDetail,
+  type LogisticsAnalysisFilters,
+  type LogisticsAnalysisLabelStatus,
+  type LogisticsAnalysisResolutionStatus,
+  type LogisticsAnalysisSessionStatus,
+} from '../services/logistics-analysis-store.js';
+import { renderLogisticsAnalyticsPage } from './logistics-analytics-page.js';
 
 export interface LogisticsAnalyticsServerOptions {
   dataDir: string;
@@ -14,10 +21,66 @@ export interface LogisticsAnalyticsServerOptions {
   host?: string;
   port?: number;
   accessToken?: string;
+  labelerRevision?: string;
 }
 
+type AnalyticsRunStatus = 'running' | 'succeeded' | 'partial' | 'failed';
+
+interface AnalyticsRunStatusProjection {
+  available: true;
+  schemaVersion: 1;
+  status: AnalyticsRunStatus;
+  startedAt: number;
+  finishedAt: number | null;
+  lastSuccessfulSyncAt: number | null;
+  lastSuccessfulCaptureAt: number | null;
+  lastSuccessfulLabelAt: number | null;
+  pendingCapture: number;
+  pendingLabel: number;
+  errorCode: string | null;
+}
+
+interface AnalyticsRunStatusUnavailable {
+  available: false;
+  message: '尚无调度记录/状态不可用';
+}
+
+const CAPTURE_STATUS_ALIASES: Record<string, LogisticsAnalysisCaptureStatus> = {
+  pending: 'pending',
+  processing: 'running',
+  running: 'running',
+  captured: 'captured',
+  partial: 'partial',
+  missing_turn: 'partial',
+  missing_answer: 'partial',
+  failed: 'failed',
+  history_failed: 'failed',
+  conflict: 'conflict',
+};
+
+const CAPTURE_STATUSES = new Set<LogisticsAnalysisCaptureStatus>([
+  'pending', 'running', 'captured', 'partial', 'failed', 'conflict',
+]);
+const LABEL_STATUSES = new Set<LogisticsAnalysisLabelStatus>([
+  'not_ready', 'pending', 'running', 'failed', 'labeled',
+]);
+const RESOLUTION_STATUSES = new Set<LogisticsAnalysisResolutionStatus>([
+  'resolved', 'in_progress', 'unknown',
+]);
+const SESSION_STATUSES = new Set<LogisticsAnalysisSessionStatus>([
+  'active', 'closed', 'unknown',
+]);
+const RUN_STATUSES = new Set<AnalyticsRunStatus>([
+  'running', 'succeeded', 'partial', 'failed',
+]);
+
 function escapeJson(value: unknown): string {
-  return JSON.stringify(value).replace(/</g, '\\u003c');
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/\\u2028/g, '\\u2028')
+    .replace(/\\u2029/g, '\\u2029');
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -27,23 +90,35 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
     'content-length': Buffer.byteLength(content),
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY',
+    'referrer-policy': 'no-referrer',
   });
   res.end(content);
 }
 
-function filters(url: URL): LogisticsConversationFilters {
-  const needsReview = url.searchParams.get('needsReview');
-  return {
-    from: url.searchParams.get('from') ?? undefined,
-    to: url.searchParams.get('to') ?? undefined,
-    larkAppId: url.searchParams.get('bot') ?? undefined,
-    businessCategory: url.searchParams.get('lb') ?? undefined,
-    problemType: url.searchParams.get('lp') ?? undefined,
-    resolutionStatus: url.searchParams.get('resolution') ?? undefined,
-    dataStatus: (url.searchParams.get('dataStatus') as LogisticsConversationFilters['dataStatus']) ?? undefined,
-    ...(needsReview === 'true' || needsReview === 'false'
-      ? { needsReview: needsReview === 'true' } : {}),
-  };
+function sendHtml(res: ServerResponse, body: string): void {
+  res.writeHead(200, {
+    'content-type': 'text/html; charset=utf-8',
+    'content-length': Buffer.byteLength(body),
+    'cache-control': 'no-store',
+    'content-security-policy': "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'",
+    'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY',
+    'referrer-policy': 'no-referrer',
+    'permissions-policy': 'camera=(), microphone=(), geolocation=()',
+  });
+  res.end(body);
+}
+
+function unauthorized(res: ServerResponse): void {
+  res.writeHead(401, {
+    'content-type': 'text/plain; charset=utf-8',
+    'www-authenticate': 'Bearer realm="botmux-analytics"',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY',
+  });
+  res.end('unauthorized');
 }
 
 function safeEqual(left: string, right: string): boolean {
@@ -57,7 +132,11 @@ function cookies(req: IncomingMessage): Record<string, string> {
   for (const part of String(req.headers.cookie ?? '').split(';')) {
     const index = part.indexOf('=');
     if (index <= 0) continue;
-    out[part.slice(0, index).trim()] = decodeURIComponent(part.slice(index + 1).trim());
+    try {
+      out[part.slice(0, index).trim()] = decodeURIComponent(part.slice(index + 1).trim());
+    } catch {
+      // Ignore malformed cookies and continue with bearer authentication.
+    }
   }
   return out;
 }
@@ -65,7 +144,7 @@ function cookies(req: IncomingMessage): Record<string, string> {
 function authorized(req: IncomingMessage, url: URL, token: string | undefined): boolean {
   if (!token) return true;
   const bearer = String(req.headers.authorization ?? '').replace(/^Bearer\s+/i, '');
-  return safeEqual(bearer || (cookies(req).botmux_analytics ?? ''), token)
+  return safeEqual(bearer || cookies(req).botmux_analytics || '', token)
     || safeEqual(url.searchParams.get('t') ?? '', token);
 }
 
@@ -79,124 +158,259 @@ function exchangeQueryToken(req: IncomingMessage, res: ServerResponse, url: URL)
     location: `${url.pathname}${url.search}`,
     'set-cookie': `botmux_analytics=${encodeURIComponent(token)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${secure ? '; Secure' : ''}`,
     'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'x-frame-options': 'DENY',
   });
   res.end();
   return true;
 }
 
-function html(): string {
-  return `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>物流专家 · 数据概览</title><style>
-:root{font-family:Inter,"Noto Sans SC","Microsoft YaHei",sans-serif;color:#162033;background:#f4f7fb}*{box-sizing:border-box}body{margin:0}.shell{max-width:1440px;margin:auto;padding:28px}.head{display:flex;justify-content:space-between;align-items:end;gap:20px}.head h1{margin:0;font-size:30px}.muted{color:#74819a}.filters,.card,.panel{background:#fff;border:1px solid #dfe6f1;border-radius:8px;box-shadow:0 5px 18px #24345a10}.filters{display:grid;grid-template-columns:repeat(9,minmax(0,1fr));gap:10px;padding:16px;margin:22px 0}.filters input,.filters select,.filters button{width:100%;min-width:0;height:40px;border:1px solid #d8e0ed;border-radius:8px;background:#f7f9fc;padding:0 12px}.filters button{background:#315bd8;color:#fff;border:0;font-weight:700;cursor:pointer}.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.card{padding:20px}.card b{display:block;font-size:32px;margin-top:10px}.grid{display:grid;grid-template-columns:2fr 1fr;gap:14px;margin-top:14px}.panel{padding:20px;min-height:280px}.panel h2{margin:0 0 16px}.trend{display:flex;align-items:end;gap:10px;height:190px;overflow-x:auto;border-bottom:1px solid #dfe6f1;padding:0 8px}.bar-col{flex:0 0 84px;text-align:center}.bar-col>.muted{font-size:11px;white-space:nowrap}.bar{background:#9eb5f7;border-radius:8px 8px 0 0;min-height:2px}.bar-col small{font-size:11px;color:#75839d}.dist-row{display:grid;grid-template-columns:130px 1fr 40px;gap:8px;align-items:center;margin:12px 0}.dist-bar{height:14px;border-radius:7px;background:#4469dc}.sessions{margin-top:14px}.table-wrap{overflow:auto}.sessions table{width:100%;border-collapse:collapse}.sessions th,.sessions td{text-align:left;padding:13px 10px;border-bottom:1px solid #e7ecf4;white-space:nowrap}.tag{padding:4px 9px;border-radius:999px;background:#edf2ff;color:#315bd8;font-size:12px}.tag.review{background:#fff1d6;color:#985f00}.legend{margin:-10px 0 18px;padding:14px 18px;min-height:0}.legend summary{cursor:pointer;font-weight:700}.legend-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:12px}.legend-list{display:grid;gap:6px}.legend-list div{font-size:13px;color:#53617a}.legend-list b{color:#22304d}.link{color:#315bd8;cursor:pointer;font-weight:700}.error{color:#b42318;background:#fff0ee;padding:12px;border-radius:8px;display:none}dialog{border:0;border-radius:8px;max-width:900px;width:90%;padding:0;box-shadow:0 18px 60px #0004}dialog::backdrop{background:#16203388}.dialog-head{display:flex;justify-content:space-between;padding:18px 22px;border-bottom:1px solid #e4e9f1}.dialog-body{padding:20px;max-height:70vh;overflow:auto}.msg{padding:12px;border-radius:8px;margin:8px 0;background:#f5f7fb}.msg.assistant{background:#edf3ff}.close{border:0;background:#eef2f7;border-radius:8px;padding:7px 10px;cursor:pointer}@media(max-width:900px){.head{align-items:flex-start}.head h1{font-size:24px}.filters{grid-template-columns:repeat(2,minmax(0,1fr))}.legend-grid{grid-template-columns:1fr}.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.grid{grid-template-columns:1fr}.shell{padding:16px}}
-</style></head><body><main class="shell">
-<div class="head"><div><h1>物流专家 · 数据概览</h1><div class="muted">BotMux 会话 SQLite · LB/LP · 自动解决状态</div></div><div class="muted" id="updated"></div></div>
-<form class="filters" id="filters"><input type="date" name="from"><input type="date" name="to"><input name="bot" placeholder="Bot App ID"><select name="lb"><option value="">全部 LB</option></select><select name="lp"><option value="">全部 LP</option></select><select name="resolution"><option value="">全部解决状态</option><option>resolved</option><option>in_progress</option><option>unknown</option></select><select name="dataStatus"><option value="">全部数据状态</option><option value="pending">待采集</option><option value="processing">采集中</option><option value="captured">已采集</option><option value="missing_turn">缺少用户问题</option><option value="missing_answer">缺少最终回答</option><option value="history_failed">历史读取失败</option><option value="skipped">特殊会话</option></select><select name="needsReview"><option value="">全部复核</option><option value="true">待复核</option><option value="false">无需复核</option></select><button>查询</button></form>
-<details class="legend panel"><summary>LB / LP 枚举速查</summary><div class="legend-grid"><div><b>LB · 核心业务领域</b><div class="legend-list" id="lb-legend"></div></div><div><b>LP · 用户需要的交付类型</b><div class="legend-list" id="lp-legend"></div></div></div></details>
-<div class="error" id="error"></div><section class="kpis" id="kpis"></section>
-<section class="grid"><div class="panel"><h2>会话量、分析覆盖与解决率趋势</h2><div class="trend" id="trend"></div></div><div class="panel"><h2>业务分类分布</h2><div id="business"></div></div></section>
-<section class="panel sessions"><h2>会话明细</h2><div class="table-wrap"><table><thead><tr><th>会话</th><th>Bot</th><th>数据状态</th><th>标签</th><th>解决状态</th><th>评分</th><th>更新时间</th><th></th></tr></thead><tbody id="sessions"></tbody></table></div></section>
-<dialog id="detail"><div class="dialog-head"><b id="detail-title">会话详情</b><button class="close" onclick="document.getElementById('detail').close()">关闭</button></div><div class="dialog-body" id="detail-body"></div></dialog>
-</main><script>
-const $=s=>document.querySelector(s), esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const LB={LB01:'电子面单 / 在线寄件',LB02:'发货 / 履约',LB03:'订单 / 售后 / 协商',LB04:'物流工具 / 页面平台',LB05:'数据 / 报表业务',LB06:'研发与助手运行环境',LB99:'其他 / 待复核'};
-const LP={LP01:'规则或能力咨询',LP02:'操作指导',LP03:'页面 / 代码 / 接口链路定位',LP04:'数据查询与分析',LP05:'线上异常 / 故障排查',LP06:'需求方案 / 研发协作',LP07:'配置 / 权限 / 运行环境',LP99:'其他 / 待复核'};
-const RES={resolved:'已解决',in_progress:'处理中',unknown:'无法确认'};
-const DATA={pending:'待采集',processing:'采集中',captured:'已采集',missing_turn:'缺少用户问题',missing_answer:'缺少最终回答',history_failed:'历史读取失败',skipped:'特殊会话'};
-const semantic=(map,key)=>key?(map[key]?key+' · '+map[key]:key):'-';
-const params=new URLSearchParams(location.search); const form=$('#filters');
-for(const [code,label] of Object.entries(LB))form.lb.add(new Option(code+' · '+label,code));
-for(const [code,label] of Object.entries(LP))form.lp.add(new Option(code+' · '+label,code));
-$('#lb-legend').innerHTML=Object.entries(LB).map(([code,label])=>'<div><b>'+code+'</b> · '+esc(label)+'</div>').join('');
-$('#lp-legend').innerHTML=Object.entries(LP).map(([code,label])=>'<div><b>'+code+'</b> · '+esc(label)+'</div>').join('');
-for(const [k,v] of params) if(form.elements[k]) form.elements[k].value=v;
-if(!params.has('from')){const d=new Date(Date.now()-29*864e5); form.from.value=d.toISOString().slice(0,10)} if(!params.has('to'))form.to.value=new Date().toISOString().slice(0,10);
-function query(){const q=new URLSearchParams(new FormData(form));for(const[k,v]of[...q])if(!v)q.delete(k);return q} async function api(path,q=query()){const r=await fetch(path+'?'+q);if(!r.ok)throw new Error(await r.text());return r.json()}
-function num(n){return new Intl.NumberFormat().format(n??0)} function pct(n){return ((n??0)*100).toFixed(1)+'%'} function time(n){return n?new Date(n).toLocaleString():'-'}
-async function load(){try{$('#error').style.display='none';const q=query();history.replaceState(null,'',location.pathname+'?'+q);const [o,t,d,s]=await Promise.all([api('api/overview',q),api('api/trend',q),api('api/distributions',q),api('api/sessions',q)]);$('#updated').textContent='刷新于 '+new Date().toLocaleTimeString();const cards=[['总 Session',num(o.totalSessions)],['可分析会话',num(o.conversations)],['已生成快照',num(o.snapshotted)],['已打标',num(o.labeled)],['已解决问题',num(o.resolved)],['分析覆盖率',pct(o.analysisCoverage)],['打标覆盖率',pct(o.labelCoverage)],['回溯失败',num(o.failedBackfill)],['待人工复核',num(o.needsReview)],['问卷记录',num(o.surveyRecords)],['已回答问卷',num(o.answeredSurveys)],['自动解决率',pct(o.resolutionRate)],['平均满意度',o.averageRating??'-']];$('#kpis').innerHTML=cards.map(x=>'<div class="card"><span class="muted">'+x[0]+'</span><b>'+x[1]+'</b></div>').join('');const max=Math.max(1,...t.map(x=>x.totalSessions));$('#trend').innerHTML=t.map(x=>'<div class="bar-col"><div class="muted">解决 '+pct(x.resolutionRate)+' · 分析 '+pct(x.totalSessions?x.conversations/x.totalSessions:0)+'</div><div class="bar" style="height:'+Math.max(2,x.totalSessions/max*135)+'px"></div><small>'+esc(x.day.slice(5))+'<br>'+x.conversations+'/'+x.totalSessions+'</small></div>').join('');const bm=Math.max(1,...d.business.map(x=>x.count));$('#business').innerHTML=d.business.map(x=>'<div class="dist-row"><span>'+esc(x.key==='unknown'?'未分析':semantic(LB,x.key))+'</span><i class="dist-bar" style="width:'+x.count/bm*100+'%"></i><b>'+x.count+'</b></div>').join('');$('#sessions').innerHTML=s.items.map(x=>'<tr><td>'+esc(x.title||x.sessionPublicId.slice(0,12))+'</td><td>'+esc(x.larkAppId)+'</td><td><span class="tag '+((x.dataStatus||'').includes('failed')?'review':'')+'">'+esc(semantic(DATA,x.dataStatus))+'</span></td><td><span class="tag">'+esc(semantic(LB,x.businessCategory)+' / '+semantic(LP,x.problemType))+'</span></td><td><span class="tag '+(x.needsReview?'review':'')+'">'+esc(x.resolutionStatus?semantic(RES,x.resolutionStatus):(x.taggingState||'-'))+'</span></td><td>'+esc(x.rating??'-')+'</td><td>'+time(x.updatedAt)+'</td><td>'+(x.conversationId?'<span class="link" data-key="'+esc(x.conversationId)+'">详情</span>':'-')+'</td></tr>').join('');document.querySelectorAll('[data-key]').forEach(el=>el.onclick=()=>show(el.dataset.key));}catch(e){$('#error').textContent=e.message;$('#error').style.display='block'}}
-async function show(key){try{const x=await api('api/sessions/'+encodeURIComponent(key),new URLSearchParams());$('#detail-title').textContent=x.title||x.sessionPublicId;$('#detail-body').innerHTML='<p><b>标签：</b>'+esc(semantic(LB,x.businessCategory)+' / '+semantic(LP,x.problemType)+' / '+semantic(RES,x.resolutionStatus))+'</p><p><b>Harness：</b>'+esc(x.harnessRevision||'-')+'　<b>复核：</b>'+esc(x.manualReviewStatus)+'</p><p><b>原因：</b>'+esc(x.reviewReason||'-')+'</p>'+x.messages.map(m=>'<div class="msg '+m.role+'"><b>'+(m.role==='user'?'用户':'助手')+'</b><div>'+esc(m.content)+'</div></div>').join('');detail.showModal()}catch(e){alert(e.message)}}
-form.onsubmit=e=>{e.preventDefault();load()};load();
-</script></body></html>`;
+function optionalQuery(url: URL, ...names: string[]): string | undefined {
+  for (const name of names) {
+    const value = url.searchParams.get(name);
+    if (value !== null && value.trim()) return value.trim();
+  }
+  return undefined;
 }
 
-function unauthorized(res: ServerResponse): void {
-  res.writeHead(401, {
-    'content-type': 'text/plain; charset=utf-8',
-    'www-authenticate': 'Bearer realm="botmux-analytics"',
-    'cache-control': 'no-store',
-  });
-  res.end('unauthorized');
+function mapCaptureStatus(url: URL): LogisticsAnalysisCaptureStatus | undefined {
+  const raw = optionalQuery(url, 'captureStatus', 'dataStatus');
+  if (!raw) return undefined;
+  const mapped = CAPTURE_STATUS_ALIASES[raw];
+  if (mapped) return mapped;
+  if (raw === 'skipped') throw new Error('analysis_data_status_unsupported:skipped');
+  throw new Error(`analysis_capture_status_invalid:${raw}`);
+}
+
+function parseNeedsReview(url: URL): boolean | undefined {
+  const raw = url.searchParams.get('needsReview');
+  if (raw === null || raw === '') return undefined;
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  throw new Error(`analysis_needs_review_invalid:${raw}`);
+}
+
+function analysisFilters(url: URL, labelerRevision: string): LogisticsAnalysisFilters {
+  const labelStatus = optionalQuery(url, 'labelStatus');
+  if (labelStatus && !LABEL_STATUSES.has(labelStatus as LogisticsAnalysisLabelStatus)) {
+    throw new Error(`analysis_label_status_invalid:${labelStatus}`);
+  }
+  const resolutionStatus = optionalQuery(url, 'resolutionStatus', 'resolution');
+  if (resolutionStatus && !RESOLUTION_STATUSES.has(resolutionStatus as LogisticsAnalysisResolutionStatus)) {
+    throw new Error(`analysis_resolution_status_invalid:${resolutionStatus}`);
+  }
+  const sessionStatus = optionalQuery(url, 'sessionStatus');
+  if (sessionStatus && !SESSION_STATUSES.has(sessionStatus as LogisticsAnalysisSessionStatus)) {
+    throw new Error(`analysis_session_status_invalid:${sessionStatus}`);
+  }
+  const scope = optionalQuery(url, 'scope');
+  if (scope && scope !== 'thread') throw new Error(`analysis_scope_invalid:${scope}`);
+  const captureStatus = mapCaptureStatus(url);
+  if (captureStatus && !CAPTURE_STATUSES.has(captureStatus)) {
+    throw new Error(`analysis_capture_status_invalid:${captureStatus}`);
+  }
+  const needsReview = parseNeedsReview(url);
+  return {
+    labelerRevision,
+    ...(optionalQuery(url, 'from') ? { from: optionalQuery(url, 'from') } : {}),
+    ...(optionalQuery(url, 'to') ? { to: optionalQuery(url, 'to') } : {}),
+    ...(optionalQuery(url, 'botId', 'bot') ? { botId: optionalQuery(url, 'botId', 'bot') } : {}),
+    ...(scope ? { scope: 'thread' as const } : {}),
+    ...(sessionStatus ? { sessionStatus: sessionStatus as LogisticsAnalysisSessionStatus } : {}),
+    ...(captureStatus ? { captureStatus } : {}),
+    ...(labelStatus ? { labelStatus: labelStatus as LogisticsAnalysisLabelStatus } : {}),
+    ...(optionalQuery(url, 'lb') ? { lb: optionalQuery(url, 'lb') } : {}),
+    ...(optionalQuery(url, 'lp') ? { lp: optionalQuery(url, 'lp') } : {}),
+    ...(resolutionStatus ? { resolutionStatus: resolutionStatus as LogisticsAnalysisResolutionStatus } : {}),
+    ...(needsReview === undefined ? {} : { needsReview }),
+  };
+}
+
+function integerQuery(url: URL, name: string, defaultValue: number): number {
+  const raw = url.searchParams.get(name);
+  if (raw === null || raw === '') return defaultValue;
+  if (!/^\d+$/.test(raw)) throw new Error(`analysis_invalid_${name}:${raw}`);
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`analysis_invalid_${name}:${raw}`);
+  return value;
+}
+
+function safeDetail(detail: LogisticsAnalysisDetail): Record<string, unknown> {
+  return {
+    topicPublicId: detail.topicPublicId,
+    title: detail.title,
+    botName: detail.botName,
+    captureStatus: detail.captureStatus,
+    labelStatus: detail.labelStatus,
+    lb: detail.lb,
+    lp: detail.lp,
+    resolutionStatus: detail.resolutionStatus,
+    confidence: detail.confidence,
+    needsReview: detail.needsReview,
+    dataTime: detail.dataTime,
+    messages: detail.messages.map(message => ({
+      role: message.role,
+      content: message.content,
+      occurredAt: message.occurredAt,
+    })),
+  };
+}
+
+function isSafeTimestamp(value: unknown, nullable: boolean): value is number | null {
+  return (nullable && value === null)
+    || (Number.isSafeInteger(value) && Number(value) >= 0);
+}
+
+function isCount(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function unavailableStatus(): AnalyticsRunStatusUnavailable {
+  return { available: false, message: '尚无调度记录/状态不可用' };
+}
+
+function readRunStatus(databasePath: string): AnalyticsRunStatusProjection | AnalyticsRunStatusUnavailable {
+  try {
+    const raw = JSON.parse(readFileSync(`${databasePath}.run.json`, 'utf8')) as Record<string, unknown>;
+    if (!raw || Array.isArray(raw) || raw.schemaVersion !== 1 || !RUN_STATUSES.has(raw.status as AnalyticsRunStatus)) {
+      return unavailableStatus();
+    }
+    const nullableTimestamps = ['finishedAt', 'lastSuccessfulSyncAt', 'lastSuccessfulCaptureAt', 'lastSuccessfulLabelAt'];
+    if (!isSafeTimestamp(raw.startedAt, false) || nullableTimestamps.some(key => !isSafeTimestamp(raw[key], true))) {
+      return unavailableStatus();
+    }
+    if (!isCount(raw.pendingCapture) || !isCount(raw.pendingLabel)) return unavailableStatus();
+    if (raw.errorCode !== null && typeof raw.errorCode !== 'string') return unavailableStatus();
+    return {
+      available: true,
+      schemaVersion: 1,
+      status: raw.status as AnalyticsRunStatus,
+      startedAt: Number(raw.startedAt),
+      finishedAt: raw.finishedAt as number | null,
+      lastSuccessfulSyncAt: raw.lastSuccessfulSyncAt as number | null,
+      lastSuccessfulCaptureAt: raw.lastSuccessfulCaptureAt as number | null,
+      lastSuccessfulLabelAt: raw.lastSuccessfulLabelAt as number | null,
+      pendingCapture: Number(raw.pendingCapture),
+      pendingLabel: Number(raw.pendingLabel),
+      errorCode: typeof raw.errorCode === 'string' ? raw.errorCode.slice(0, 200) : null,
+    };
+  } catch {
+    return unavailableStatus();
+  }
+}
+
+function openReadOnlyStore(dataDir: string, databasePath: string): LogisticsAnalysisStore {
+  if (!existsSync(databasePath)) throw new Error('analytics_database_missing');
+  try {
+    return new LogisticsAnalysisStore({ dataDir, path: databasePath, readOnly: true });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.startsWith('analysis_database_not_four_table')
+      || message.startsWith('analysis_schema_version_unsupported')) {
+      throw new Error('analytics_database_unsupported_four_table_only');
+    }
+    throw error;
+  }
 }
 
 export function createLogisticsAnalyticsServer(options: LogisticsAnalyticsServerOptions) {
-  const path = options.databasePath ?? join(options.dataDir, 'botmux-conversations.sqlite');
-  if (!existsSync(path)) throw new Error(`analytics_database_missing:${path}`);
-  const store = new LogisticsConversationStore({ dataDir: options.dataDir, path, readOnly: true });
+  const labelerRevision = options.labelerRevision?.trim();
+  if (!labelerRevision) throw new Error('analysis_labeler_revision_required');
+  if (options.host && options.host !== '127.0.0.1' && options.host !== '::1' && !options.accessToken) {
+    throw new Error('BOTMUX_ANALYTICS_TOKEN is required when binding beyond loopback');
+  }
+  const databasePath = resolve(options.databasePath ?? join(options.dataDir, 'logistics-analysis.sqlite'));
+  const store = openReadOnlyStore(options.dataDir, databasePath);
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? '/', 'http://localhost');
+    if (req.method !== 'GET') {
+      res.writeHead(405, { allow: 'GET', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+      return res.end('method_not_allowed');
+    }
     if (!authorized(req, url, options.accessToken)) return unauthorized(res);
     if (options.accessToken && exchangeQueryToken(req, res, url)) return;
     try {
-      if (req.method === 'GET' && url.pathname === '/favicon.ico') {
-        res.writeHead(204, { 'cache-control': 'public, max-age=86400' });
+      if (url.pathname === '/favicon.ico') {
+        res.writeHead(204, { 'cache-control': 'no-store' });
         return res.end();
       }
-      if (req.method === 'GET' && url.pathname === '/healthz') return sendJson(res, 200, { ok: true });
-      if (req.method === 'GET' && url.pathname === '/api/overview') return sendJson(res, 200, store.summary(filters(url)));
-      if (req.method === 'GET' && url.pathname === '/api/trend') return sendJson(res, 200, store.trend(filters(url)));
-      if (req.method === 'GET' && url.pathname === '/api/distributions') return sendJson(res, 200, store.distributions(filters(url)));
-      if (req.method === 'GET' && url.pathname === '/api/sessions') {
-        const limit = Number(url.searchParams.get('limit') ?? 50);
-        const offset = Number(url.searchParams.get('offset') ?? 0);
-        return sendJson(res, 200, store.list(filters(url), { limit, offset }));
+      if (url.pathname === '/healthz') return sendJson(res, 200, { ok: true });
+      if (url.pathname === '/api/status') return sendJson(res, 200, readRunStatus(databasePath));
+      if (url.pathname === '/api/overview') {
+        return sendJson(res, 200, store.summary(analysisFilters(url, labelerRevision)));
       }
-      const detail = url.pathname.match(/^\/api\/sessions\/(.+)$/);
-      if (req.method === 'GET' && detail) {
-        const item = store.detail(decodeURIComponent(detail[1]!));
-        return item ? sendJson(res, 200, item) : sendJson(res, 404, { error: 'not_found' });
+      if (url.pathname === '/api/trend') {
+        return sendJson(res, 200, store.trend(analysisFilters(url, labelerRevision)));
       }
-      if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/overview')) {
-        const body = html();
-        res.writeHead(200, {
-          'content-type': 'text/html; charset=utf-8',
-          'content-length': Buffer.byteLength(body),
-          'cache-control': 'no-store',
-          'content-security-policy': "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'",
-          'x-content-type-options': 'nosniff',
-          'x-frame-options': 'DENY',
-          'referrer-policy': 'no-referrer',
-        });
-        return res.end(body);
+      if (url.pathname === '/api/distributions') {
+        return sendJson(res, 200, store.distributions(analysisFilters(url, labelerRevision)));
       }
-      sendJson(res, 404, { error: 'not_found' });
+      if (url.pathname === '/api/sessions') {
+        return sendJson(res, 200, store.list(analysisFilters(url, labelerRevision), {
+          limit: integerQuery(url, 'limit', 50),
+          offset: integerQuery(url, 'offset', 0),
+        }));
+      }
+      const detailMatch = url.pathname.match(/^\/api\/sessions\/(.+)$/);
+      if (detailMatch) {
+        const item = store.detail(decodeURIComponent(detailMatch[1]!), { labelerRevision });
+        return item ? sendJson(res, 200, safeDetail(item)) : sendJson(res, 404, { error: 'not_found' });
+      }
+      if (url.pathname === '/' || url.pathname === '/overview') {
+        return sendHtml(res, renderLogisticsAnalyticsPage());
+      }
+      return sendJson(res, 404, { error: 'not_found' });
     } catch (error) {
-      sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+      const message = error instanceof Error ? error.message : String(error);
+      const code = message.startsWith('analysis_') ? message.slice(0, 240) : 'analytics_request_failed';
+      return sendJson(res, 400, { error: code });
     }
   });
   server.on('close', () => store.close());
   return server;
 }
 
-function arg(args: string[], flag: string): string | undefined {
+function optionValue(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag);
-  if (index >= 0) return args[index + 1];
-  return args.find(item => item.startsWith(`${flag}=`))?.slice(flag.length + 1);
+  if (index >= 0) {
+    const next = args[index + 1];
+    if (!next || next.startsWith('--')) throw new Error(`analytics_option_value_required:${flag}`);
+    return next;
+  }
+  const prefix = `${flag}=`;
+  const equal = args.find(item => item.startsWith(prefix));
+  return equal?.slice(prefix.length) || undefined;
+}
+
+function assertKnownOptions(args: string[]): void {
+  const known = new Set(['--host', '--port', '--db', '--harness-root', '--labeler-revision']);
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]!;
+    const flag = arg.includes('=') ? arg.slice(0, arg.indexOf('=')) : arg;
+    if (!known.has(flag)) throw new Error(`analytics_option_unknown:${arg}`);
+    if (!arg.includes('=')) index += 1;
+  }
 }
 
 export async function runLogisticsAnalyticsCommand(sub: string, args: string[], dataDir: string): Promise<void> {
   if (sub !== 'serve') {
-    console.error('Usage: botmux analytics serve [--host 127.0.0.1] [--port 17870] [--db <path>]');
-    process.exit(2);
+    throw new Error('Usage: botmux analytics serve [--host 127.0.0.1] [--port 17870] [--db <path>] [--harness-root <dir>|--labeler-revision <revision>]');
   }
-  const host = arg(args, '--host') ?? process.env.BOTMUX_ANALYTICS_HOST ?? '127.0.0.1';
-  const port = Number(arg(args, '--port') ?? process.env.BOTMUX_ANALYTICS_PORT ?? 17870);
-  const databasePath = resolve(arg(args, '--db') ?? process.env.BOTMUX_ANALYTICS_DB ?? join(dataDir, 'botmux-conversations.sqlite'));
+  assertKnownOptions(args);
+  const host = optionValue(args, '--host') ?? process.env.BOTMUX_ANALYTICS_HOST ?? '127.0.0.1';
+  const port = Number(optionValue(args, '--port') ?? process.env.BOTMUX_ANALYTICS_PORT ?? 17870);
+  const dbArg = optionValue(args, '--db');
+  const databasePath = resolve(dbArg ?? process.env.BOTMUX_ANALYTICS_DB ?? join(dataDir, 'logistics-analysis.sqlite'));
+  const harnessRoot = optionValue(args, '--harness-root') ?? process.env.LOGISTICS_CONVERSATION_HARNESS_ROOT;
+  const explicitRevision = optionValue(args, '--labeler-revision')?.trim();
+  const labelerRevision = explicitRevision || (harnessRoot ? resolveLogisticsHarnessRevision(harnessRoot) : undefined);
+  if (!labelerRevision) throw new Error('analysis_labeler_revision_required');
   const accessToken = process.env.BOTMUX_ANALYTICS_TOKEN?.trim() || undefined;
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`invalid_analytics_port:${port}`);
   if (host !== '127.0.0.1' && host !== '::1' && !accessToken) {
     throw new Error('BOTMUX_ANALYTICS_TOKEN is required when binding beyond loopback');
   }
-  const server = createLogisticsAnalyticsServer({ dataDir, databasePath, host, port, accessToken });
+  const server = createLogisticsAnalyticsServer({ dataDir, databasePath, host, port, accessToken, labelerRevision });
   await new Promise<void>((resolvePromise, reject) => {
     server.once('error', reject);
     server.listen(port, host, () => {
@@ -204,7 +418,12 @@ export async function runLogisticsAnalyticsCommand(sub: string, args: string[], 
       resolvePromise();
     });
   });
-  const stop = () => server.close(() => process.exit(0));
+  let stopping = false;
+  const stop = () => {
+    if (stopping) return;
+    stopping = true;
+    server.close(() => process.exit(0));
+  };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
   await new Promise(() => {});
