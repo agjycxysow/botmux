@@ -38,6 +38,29 @@ const record: LogisticsSessionMasterRecord = {
 };
 
 describe('logistics session model task', () => {
+
+  it.skipIf(process.platform === 'win32')('reports CLI timeouts without exposing the frozen prompt', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'logistics-exec-timeout-'));
+    try {
+      const cli = join(dir, 'fake-codex');
+      await writeFile(cli, '#!/usr/bin/env node\nsetInterval(() => {}, 1000);\n', { mode: 0o700 });
+      const runner = createLogisticsSessionModelTaskRunner({ cliId: 'codex', cliPathOverride: cli, timeoutMs: 100 });
+      await expect(runner({ record })).rejects.toThrow(/^model_task_timeout$/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports a missing CLI without exposing command arguments', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'logistics-exec-missing-'));
+    try {
+      const runner = createLogisticsSessionModelTaskRunner({ cliId: 'codex', cliPathOverride: join(dir, 'missing-cli') });
+      await expect(runner({ record })).rejects.toThrow(/^model_task_cli_missing$/);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('accepts only the established LB/LP taxonomy and discrete resolution states', () => {
     expect(parseLogisticsModelTaskOutput(JSON.stringify({
       businessCategory: 'LB02',

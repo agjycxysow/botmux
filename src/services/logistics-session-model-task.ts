@@ -53,8 +53,14 @@ const defaultExec: LogisticsSessionModelTaskExec = async (file, args, options) =
       encoding: 'utf8',
     }, (error, stdout, stderr) => {
       if (error) {
-        const detail = String(stderr ?? '').trim().split('\n').slice(-2).join(' ').slice(0, 200);
-        reject(new Error(`${error.message.split('\n')[0]}${detail ? ` | stderr: ${detail}` : ''}`));
+        const code = error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'
+          ? 'model_task_output_too_large'
+          : error.killed ? 'model_task_timeout'
+          : error.code === 'ENOENT' ? 'model_task_cli_missing'
+          : 'model_task_exec_failed';
+        // Do not persist command arguments or stderr: they can contain the
+        // frozen conversation or provider credentials.
+        reject(new Error(code));
         return;
       }
       resolve({ stdout: String(stdout ?? '') });
