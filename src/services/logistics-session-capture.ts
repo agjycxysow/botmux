@@ -40,10 +40,6 @@ export interface BuildLogisticsSessionSnapshotInput {
 
 const DEFAULT_MAX_TRANSCRIPT_CHARS = 12_000;
 
-function roleForMessage(senderType: string | undefined): string {
-  return senderType === 'user' ? '用户' : senderType === 'app' ? '助手' : '消息';
-}
-
 function snapshotRole(senderType: string | undefined): LogisticsSnapshotMessage['role'] | undefined {
   if (senderType === 'user') return 'user';
   if (senderType === 'app') return 'assistant';

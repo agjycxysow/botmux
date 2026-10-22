@@ -351,9 +351,6 @@ const CAPTURE_STATUSES = new Set<LogisticsAnalysisCaptureStatus>([
 const LABEL_STATUSES = new Set<LogisticsAnalysisLabelStatus>([
   'not_ready', 'pending', 'running', 'failed', 'labeled',
 ]);
-const LABEL_RUN_STATUSES = new Set<LogisticsAnalysisLabelRunStatus>([
-  'running', 'succeeded', 'failed', 'expired', 'skipped',
-]);
 const SOURCES = new Set<LogisticsAnalysisMessageSource>([
   'lark_history', 'botmux_send_marker', 'codex_rollout', 'legacy',
 ]);

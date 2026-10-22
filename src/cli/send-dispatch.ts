@@ -1,42 +1,17 @@
-import { createHash } from 'node:crypto';
 import { extname } from 'node:path';
+import { formatLarkError } from '../bot-registry.js';
+import {
+  contentAuditSendRemediation,
+  isLarkContentAuditError,
+  larkErrorCode,
+} from '../im/lark/content-audit.js';
+import {
+  findDisallowedCardCallback,
+  type InteractiveCardCallbackPolicy,
+} from '../core/card-callback-policy.js';
 import type { ManagedHookOrigin } from '../services/hook-runner.js';
-
-export type CliSendProviderUuidInput = {
-  sessionId: string;
-  turnId?: string;
-  appId: string;
-  targetChatId: string;
-  quoteTargetId?: string;
-  threadRootId?: string;
-  content: string;
-  msgType: string;
-};
-
-/**
- * Build the Feishu UUID for a normal `botmux send` provider effect.
- *
- * A managed turn can be replayed by its host after the command has already
- * reached Lark. Keep the UUID stable for that exact turn, payload, and target
- * so Lark returns the original message instead of creating a second one.
- * Manual sends do not have an authoritative turn identity and retain their
- * historical non-deduplicated behavior.
- */
-export function cliSendProviderUuid(input: CliSendProviderUuidInput): string | undefined {
-  if (!input.turnId) return undefined;
-  const identity = JSON.stringify({
-    v: 1,
-    sessionId: input.sessionId,
-    turnId: input.turnId,
-    appId: input.appId,
-    targetChatId: input.targetChatId,
-    quoteTargetId: input.quoteTargetId ?? null,
-    threadRootId: input.threadRootId ?? null,
-    content: input.content,
-    msgType: input.msgType,
-  });
-  return `bms_${createHash('sha256').update(identity).digest('hex').slice(0, 46)}`;
-}
+import type { OutboundMessageOptions } from '../im/lark/client.js';
+import type { GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
 
 export type SendMessageFn = (
   larkAppId: string,
@@ -45,7 +20,7 @@ export type SendMessageFn = (
   msgType?: string,
   uuid?: string,
   hookContext?: Record<string, unknown>,
-  options?: { suppressHook?: boolean; beforeHook?: () => void | Promise<void>; hookOrigin?: ManagedHookOrigin },
+  options?: OutboundMessageOptions,
 ) => Promise<string>;
 
 export type ReplyMessageFn = (
@@ -56,13 +31,25 @@ export type ReplyMessageFn = (
   replyInThread?: boolean,
   uuid?: string,
   hookContext?: Record<string, unknown>,
-  options?: { suppressHook?: boolean; beforeHook?: () => void | Promise<void>; hookOrigin?: ManagedHookOrigin },
+  options?: OutboundMessageOptions,
 ) => Promise<string>;
 
 export type DispatchPrimaryDeps = {
   sendMessage: SendMessageFn;
   replyMessage: ReplyMessageFn;
 };
+
+/** Keep provider details visible without leaking Axios config or headers.
+ *  Content-audit rejections are permanent and content-specific: append an
+ *  actionable remediation line so the model in the worker PTY corrects the
+ *  payload instead of resending verbatim (which fails identically). */
+export function describeSendFailure(err: unknown): string {
+  const detail = formatLarkError(err)
+    ?? (err instanceof Error && err.message ? err.message : String(err));
+  return isLarkContentAuditError(err)
+    ? `${detail}\n${contentAuditSendRemediation(larkErrorCode(err))}`
+    : detail;
+}
 
 /**
  * Paths that resolve to the process's own stdin. `botmux send` reads stdin for
@@ -119,9 +106,7 @@ export function validateSlashSend(raw: string): SlashSendValidation {
 
 export type SendFileAttachmentsDeps = {
   uploadFile: (appId: string, path: string) => Promise<string>;
-  dispatch: (content: string, msgType: string, uuid?: string) => Promise<string>;
-  /** Stable provider key for this source attachment when a managed turn replays. */
-  providerUuid?: (path: string, index: number) => string | undefined;
+  dispatch: (content: string, msgType: string) => Promise<string>;
   beforeEffect?: () => void | Promise<void>;
 };
 
@@ -145,18 +130,14 @@ export async function sendFileAttachments(
 ): Promise<SendFileAttachmentsResult> {
   const sent: string[] = [];
   const failed: { path: string; error: string }[] = [];
-  for (const [index, fp] of files.entries()) {
+  for (const fp of files) {
     try {
       await deps.beforeEffect?.();
       const fileKey = await deps.uploadFile(appId, fp);
       await deps.beforeEffect?.();
-      const content = JSON.stringify({ file_key: fileKey });
-      const uuid = deps.providerUuid?.(fp, index);
-      sent.push(await (uuid
-        ? deps.dispatch(content, 'file', uuid)
-        : deps.dispatch(content, 'file')));
-    } catch (err: any) {
-      failed.push({ path: fp, error: err?.message ?? String(err) });
+      sent.push(await deps.dispatch(JSON.stringify({ file_key: fileKey }), 'file'));
+    } catch (err: unknown) {
+      failed.push({ path: fp, error: describeSendFailure(err) });
     }
   }
   return { sent, failed };
@@ -261,86 +242,6 @@ function cardObjectFromValue(value: unknown, label: string): { ok: true; card: R
   return { ok: true, card };
 }
 
-// Interactive INPUT controls that fire a card.action.trigger callback on use.
-// Custom cards are display-only, so these are rejected by tag even when they
-// carry no `value` payload (selecting/picking still fires a callback). `button`
-// is NOT here — it's special-cased below (open_url buttons are legit jumps).
-// `checker` is Feishu's documented no-callback-by-default exception; a checker
-// that opts into a callback is still caught by its `type:'callback'` behavior.
-const CALLBACK_CONTROL_TAGS = new Set([
-  'select_static', 'multi_select_static',
-  'select_person', 'multi_select_person',
-  'select_img', 'multi_select_img',
-  'overflow', 'input',
-  'date_picker', 'picker_time', 'picker_datetime',
-]);
-
-// A button is display/jump ONLY when it opens a URL: v2 `behaviors` carrying an
-// `open_url`, or v1 non-empty `url`/`multi_url`. Everything else (a plain button,
-// or one carrying an own `value` callback payload) round-trips a callback.
-function isOpenUrlButton(el: Record<string, unknown>): boolean {
-  if (typeof el.url === 'string' && el.url.trim() !== '') return true;
-  if (el.multi_url !== undefined && el.multi_url !== null) return true;
-  return Array.isArray(el.behaviors)
-    && el.behaviors.some(b => isRecord(b) && b.type === 'open_url');
-}
-
-// Find any element that would produce a Lark card.action.trigger callback.
-// Custom cards are display + open_url only, so ALL callback-capable controls
-// are rejected — not just the ones whose payload hits a botmux privileged
-// dispatch. Returns the offending JSON path, or null if the card is clean.
-function findDisallowedCardCallback(value: unknown, path = 'card'): string | null {
-  if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) {
-      const found = findDisallowedCardCallback(value[i], `${path}[${i}]`);
-      if (found) return found;
-    }
-    return null;
-  }
-  if (!isRecord(value)) return null;
-
-  // v2 `behaviors:[{type:'callback'}]` fires a server-side card.action.trigger
-  // callback. open_url behaviors are display/jump only and stay allowed.
-  if (value.type === 'callback') return `${path}.type`;
-  // Form submit/reset buttons ALSO fire card.action.trigger (delivering
-  // form_value to the handler). Feishu marks them with real schema fields —
-  // v2 `form_action_type:'submit'|'reset'`, v1 `action_type:'form_submit'|
-  // 'form_reset'` (see settings-card.ts / card-builder.ts) — NOT a
-  // `type:'form_action'`. Reject those so a custom card stays display-only.
-  if (typeof value.form_action_type === 'string') return `${path}.form_action_type`;
-  if (value.action_type === 'form_submit' || value.action_type === 'form_reset') {
-    return `${path}.action_type`;
-  }
-  if (typeof value.tag === 'string') {
-    // Interactive input controls (dropdowns/pickers/inputs/image-select) — reject
-    // by tag even without a `value` payload; interacting still fires a callback.
-    if (CALLBACK_CONTROL_TAGS.has(value.tag)) return `${path}.tag(${value.tag})`;
-    // A button is allowed only as an open_url jump with NO own `value` payload.
-    // `value` may be a plain string OR object (both round-trip a callback), so
-    // reject on presence, not shape. A plain button (no open_url) also fires a
-    // callback — reject. NOTE: only card ELEMENTS (nodes with a `tag`) are judged
-    // this way, so free-form chart_spec data like `{tag:'x', value:{…}}` isn't
-    // misread as a control.
-    if (value.tag === 'button') {
-      if ('value' in value && value.value !== undefined) return `${path}.value`;
-      if (!isOpenUrlButton(value)) return `${path}.tag(button)`;
-    }
-  }
-  // Belt: reserved botmux routing discriminators anywhere (defence in depth —
-  // e.g. a value round-tripped inside a behavior, or a tag we didn't enumerate).
-  if (isRecord(value.value)) {
-    for (const field of ['action', 'key', 'root_id'] as const) {
-      if (typeof value.value[field] === 'string') return `${path}.value.${field}`;
-    }
-  }
-
-  for (const [key, child] of Object.entries(value)) {
-    const found = findDisallowedCardCallback(child, `${path}.${key}`);
-    if (found) return found;
-  }
-  return null;
-}
-
 /**
  * Normalize user-supplied Lark/Feishu interactive card JSON into the raw card
  * body expected by the Lark send/reply APIs. Accepts either:
@@ -348,12 +249,17 @@ function findDisallowedCardCallback(value: unknown, path = 'card'): string | nul
  *   - webhook/openapi-style wrapper: {"msg_type":"interactive","card":{...}}
  *   - wrapper with string/object content: {"msg_type":"interactive","content":"{...}"}
  *
- * Deliberately rejects callback actions. botmux owns a broad card-action
+ * Rejects callback actions by default. botmux owns a broad card-action
  * namespace (close/restart/ask/relay/dashboard/etc.); arbitrary callbacks from
  * a CLI-created card would be routed through those handlers with host-side
- * privileges after a user clicks. Display cards and open-url buttons still work.
+ * privileges after a user clicks. An explicit callbackPolicy may admit only
+ * actions that resolve to one selected, enabled plugin; built-in key/root
+ * discriminators remain sealed. Display cards and open-url buttons still work.
  */
-export function normalizeInteractiveCardInput(raw: string): NormalizedInteractiveCardResult {
+export function normalizeInteractiveCardInput(
+  raw: string,
+  options: { callbackPolicy?: InteractiveCardCallbackPolicy } = {},
+): NormalizedInteractiveCardResult {
   if (!raw.trim()) return { ok: false, error: '自定义卡片 JSON 不能为空' };
 
   const parsed = parseJson(raw, '自定义卡片 JSON');
@@ -379,7 +285,11 @@ export function normalizeInteractiveCardInput(raw: string): NormalizedInteractiv
   const normalized = cardObjectFromValue(cardSource, '自定义卡片');
   if (!normalized.ok) return normalized;
 
-  const callbackPath = findDisallowedCardCallback(normalized.card);
+  const callbackPath = findDisallowedCardCallback(
+    normalized.card,
+    'card',
+    options.callbackPolicy,
+  );
   if (callbackPath) {
     return {
       ok: false,
@@ -393,16 +303,14 @@ export function normalizeInteractiveCardInput(raw: string): NormalizedInteractiv
 export type SendVideoAttachmentsDeps = {
   uploadFile: (appId: string, path: string) => Promise<string>;
   uploadImage: (appId: string, path: string) => Promise<string>;
-  dispatch: (content: string, msgType: string, uuid?: string) => Promise<string>;
+  dispatch: (content: string, msgType: string) => Promise<string>;
   // Optional: dispatch used for the FIRST successfully-sent video only. A
   // pure-video send (no text/card primary) has no other message to carry the
   // quote/reply chain, so its first media message must go through the primary
   // dispatch (which applies the chat-scope quoteTargetId) to stay consistent
   // with card/file/image sends. Later videos remain best-effort via `dispatch`.
   // Omitted for secondary sends (card is already the primary) → all use `dispatch`.
-  primaryDispatch?: (content: string, msgType: string, uuid?: string) => Promise<string>;
-  /** Stable provider key for this source attachment when a managed turn replays. */
-  providerUuid?: (video: VideoAttachmentInput, index: number, isPrimary: boolean) => string | undefined;
+  primaryDispatch?: (content: string, msgType: string) => Promise<string>;
   /** Optional hard cap checked before any upload/dispatch. Managed VC pure-video
    * replies set this to one because only the primary media message has a durable
    * action/provider identity; later bare media sends would duplicate on replay. */
@@ -431,7 +339,7 @@ export async function sendVideoAttachments(
   // every later one uses plain `dispatch`. Tracked on success only, so if the
   // first video's upload fails the next one inherits the primary slot.
   let primaryUsed = false;
-  for (const [index, video] of videos.entries()) {
+  for (const video of videos) {
     try {
       await deps.beforeEffect?.();
       const fileKey = await deps.uploadFile(appId, video.videoPath);
@@ -442,20 +350,16 @@ export async function sendVideoAttachments(
         image_key: imageKey,
         duration: video.durationMs,
       });
-      const isPrimary = !primaryUsed && !!deps.primaryDispatch;
-      const send = isPrimary ? deps.primaryDispatch! : deps.dispatch;
-      const uuid = deps.providerUuid?.(video, index, isPrimary);
+      const send = (!primaryUsed && deps.primaryDispatch) ? deps.primaryDispatch : deps.dispatch;
       await deps.beforeEffect?.();
-      const messageId = await (uuid
-        ? send(content, 'media', uuid)
-        : send(content, 'media'));
+      const messageId = await send(content, 'media');
       primaryUsed = true;
       sent.push(messageId);
-    } catch (err: any) {
+    } catch (err: unknown) {
       failed.push({
         path: video.videoPath,
         coverPath: video.coverPath,
-        error: err?.message ?? String(err),
+        error: describeSendFailure(err),
       });
     }
   }
@@ -478,9 +382,12 @@ export type DispatchPrimaryOptions = {
   /** Revalidate immediately before the distinct post-provider hook effect. */
   beforeHook?: () => void | Promise<void>;
   hookOrigin?: ManagedHookOrigin;
+  groupContextAuthorOrigin?: GroupContextDeliveryBinding;
   /** Revalidate any side-effect authority after an awaited quote failure and
    * immediately before the fallback creates a top-level message. */
   beforeQuoteFallback?: () => void | Promise<void>;
+  /** Passed into the transport gate, including its queued retries. */
+  beforeWrite?: () => void | Promise<void>;
   /** Revalidate managed authority immediately before each provider call. */
   beforeEffect?: () => void | Promise<void>;
   onQuoteWithdrawn?: (messageId: string) => void;
@@ -505,6 +412,16 @@ export async function dispatchPrimaryMessage(
     };
   }
 
+  const hookOptions: OutboundMessageOptions | undefined = opts.suppressHook || opts.beforeHook || opts.groupContextAuthorOrigin || opts.beforeWrite
+    ? {
+        ...(opts.suppressHook ? { suppressHook: true } : opts.beforeHook ? {
+          beforeHook: opts.beforeHook,
+          ...(opts.hookOrigin ? { hookOrigin: opts.hookOrigin } : {}),
+        } : {}),
+        ...(opts.groupContextAuthorOrigin ? { groupContextAuthorOrigin: opts.groupContextAuthorOrigin } : {}),
+        ...(opts.beforeWrite ? { beforeWrite: opts.beforeWrite } : {}),
+      }
+    : undefined;
   try {
     await opts.beforeEffect?.();
     const args = [
@@ -516,14 +433,6 @@ export async function dispatchPrimaryMessage(
       opts.uuid,
       opts.hookContext,
     ] as const;
-    const hookOptions = opts.suppressHook
-      ? { suppressHook: true as const }
-      : opts.beforeHook
-        ? {
-            beforeHook: opts.beforeHook,
-            ...(opts.hookOrigin ? { hookOrigin: opts.hookOrigin } : {}),
-          }
-        : undefined;
     const messageId = hookOptions
       ? await deps.replyMessage(...args, hookOptions)
       : await deps.replyMessage(...args);
@@ -538,7 +447,7 @@ export async function dispatchPrimaryMessage(
       else await opts.beforeEffect?.();
       opts.onQuoteWithdrawn?.(opts.quoteTargetId);
       return {
-        messageId: await (opts.suppressHook
+        messageId: await (hookOptions
           ? deps.sendMessage(
               opts.appId,
               opts.targetChatId,
@@ -546,29 +455,16 @@ export async function dispatchPrimaryMessage(
               opts.msgType,
               opts.uuid,
               opts.hookContext,
-              { suppressHook: true },
+              hookOptions,
             )
-          : opts.beforeHook
-            ? deps.sendMessage(
-                opts.appId,
-                opts.targetChatId,
-                opts.content,
-                opts.msgType,
-                opts.uuid,
-                opts.hookContext,
-                {
-                  beforeHook: opts.beforeHook,
-                  ...(opts.hookOrigin ? { hookOrigin: opts.hookOrigin } : {}),
-                },
-              )
-            : deps.sendMessage(
-                opts.appId,
-                opts.targetChatId,
-                opts.content,
-                opts.msgType,
-                opts.uuid,
-                opts.hookContext,
-              )),
+          : deps.sendMessage(
+              opts.appId,
+              opts.targetChatId,
+              opts.content,
+              opts.msgType,
+              opts.uuid,
+              opts.hookContext,
+            )),
         primaryQuotedId: null,
       };
     }

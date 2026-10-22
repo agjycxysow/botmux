@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import {
-  cliSendProviderUuid,
+  describeSendFailure,
   dispatchPrimaryMessage,
   findStdinAliasAttachment,
   normalizeInteractiveCardInput,
@@ -13,36 +13,29 @@ import {
 
 class MessageWithdrawnError extends Error {}
 
-describe('cliSendProviderUuid', () => {
-  const base = {
-    sessionId: 'session-1',
-    turnId: 'turn-1',
-    appId: 'cli_app',
-    targetChatId: 'oc_chat',
-    quoteTargetId: 'om_quote',
-    content: 'same reply',
-    msgType: 'interactive',
-  };
+describe('describeSendFailure', () => {
+  it('preserves Lark business details instead of falling back to the HTTP message', () => {
+    const err = {
+      isAxiosError: true,
+      message: 'Request failed with status code 400',
+      config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
+      response: {
+        status: 400,
+        data: {
+          code: 230022,
+          msg: 'content contains sensitive information',
+          log_id: 'LOGREAL123',
+        },
+      },
+    };
 
-  it('returns a stable provider UUID for a replayed turn send', () => {
-    const first = cliSendProviderUuid(base);
-    const replay = cliSendProviderUuid({ ...base });
-
-    expect(first).toBe(replay);
-    expect(first).toMatch(/^bms_[a-f0-9]{46}$/);
-    expect(first).toHaveLength(50);
+    expect(describeSendFailure(err)).toBe(
+      'POST im/v1/messages → 400 code=230022 "content contains sensitive information" log_id=LOGREAL123',
+    );
   });
 
-  it('changes the provider UUID when the turn or delivered payload changes', () => {
-    const original = cliSendProviderUuid(base);
-
-    expect(cliSendProviderUuid({ ...base, turnId: 'turn-2' })).not.toBe(original);
-    expect(cliSendProviderUuid({ ...base, content: 'different reply' })).not.toBe(original);
-    expect(cliSendProviderUuid({ ...base, quoteTargetId: undefined })).not.toBe(original);
-  });
-
-  it('does not opt manual sends without an authoritative turn into deduplication', () => {
-    expect(cliSendProviderUuid({ ...base, turnId: undefined })).toBeUndefined();
+  it('falls back to a plain Error message for non-Lark failures', () => {
+    expect(describeSendFailure(new Error('upload boom'))).toBe('upload boom');
   });
 });
 
@@ -58,6 +51,24 @@ describe('dispatchPrimaryMessage hook context wiring', () => {
     },
     MessageWithdrawnError,
   };
+
+  it.each([false, true])('keeps the exact native author on a quote and withdrawn fallback=%s', async withdrawn => {
+    const groupContextAuthorOrigin = {
+      appId: 'cli_app', chatId: 'oc_chat', sessionId: 'sid_1', turnId: 'om_turn', epoch: 'native_epoch',
+    };
+    const replyMessage = vi.fn(async () => {
+      if (withdrawn) throw new MessageWithdrawnError('withdrawn');
+      return 'om_reply';
+    });
+    const sendMessage = vi.fn(async () => 'om_send');
+    await dispatchPrimaryMessage({ replyMessage, sendMessage }, {
+      ...baseOptions, quoteTargetId: 'om_quote', content: 'Authored answer', msgType: 'text',
+      groupContextAuthorOrigin, suppressHook: true, dispatch: vi.fn(async () => 'unused'),
+    });
+    expect(replyMessage.mock.calls[0]?.at(-1)).toEqual({ suppressHook: true, groupContextAuthorOrigin });
+    if (withdrawn) expect(sendMessage.mock.calls[0]?.at(-1)).toEqual({ suppressHook: true, groupContextAuthorOrigin });
+    else expect(sendMessage).not.toHaveBeenCalled();
+  });
 
   it('passes hookContext when quote reply succeeds', async () => {
     const replyMessage = vi.fn(async () => 'om_reply');
@@ -227,23 +238,6 @@ describe('sendFileAttachments (best-effort, never throws after primary send)', (
     expect(uploadFile).toHaveBeenCalledTimes(2);
   });
 
-  it('passes one stable provider UUID per file attachment', async () => {
-    const uploadFile = vi.fn(async (_app: string, p: string) => `key:${p}`);
-    const dispatch = vi.fn(async (content: string) => `om:${content}`);
-    const providerUuid = vi.fn((path: string, index: number) => `bms_file_${index}_${path}`);
-
-    await sendFileAttachments(
-      { uploadFile, dispatch, providerUuid },
-      'cli_app',
-      ['/a', '/b'],
-    );
-
-    expect(providerUuid).toHaveBeenNthCalledWith(1, '/a', 0);
-    expect(providerUuid).toHaveBeenNthCalledWith(2, '/b', 1);
-    expect(dispatch).toHaveBeenNthCalledWith(1, '{"file_key":"key:/a"}', 'file', 'bms_file_0_/a');
-    expect(dispatch).toHaveBeenNthCalledWith(2, '{"file_key":"key:/b"}', 'file', 'bms_file_1_/b');
-  });
-
   it('captures a failing attachment without throwing and still sends the others', async () => {
     const uploadFile = vi.fn(async (_app: string, p: string) => {
       if (p === '/bad') throw new Error('upload boom');
@@ -268,6 +262,28 @@ describe('sendFileAttachments (best-effort, never throws after primary send)', (
       { path: '/x', error: 'dispatch down' },
       { path: '/y', error: 'dispatch down' },
     ]);
+  });
+
+  it('surfaces the Lark business error (code/log_id) instead of a bare HTTP message', async () => {
+    const uploadFile = vi.fn(async (_app: string, p: string) => {
+      if (p === '/bad') {
+        throw {
+          isAxiosError: true,
+          config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
+          response: { status: 400, data: { code: 230022, msg: 'content contains sensitive information', log_id: 'LOG789' } },
+          message: 'Request failed with status code 400',
+        };
+      }
+      return `key:${p}`;
+    });
+    const dispatch = vi.fn(async (content: string) => `om:${content}`);
+
+    const res = await sendFileAttachments({ uploadFile, dispatch }, 'cli_app', ['/bad']);
+
+    expect(res.failed).toEqual([{
+      path: '/bad',
+      error: 'POST im/v1/messages → 400 code=230022 "content contains sensitive information" log_id=LOG789',
+    }]);
   });
 });
 
@@ -332,6 +348,23 @@ describe('validateVideoAttachments', () => {
 });
 
 describe('normalizeInteractiveCardInput', () => {
+  it('rejects a forged completion proposal callback from a custom card', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      schema: '2.0',
+      body: { elements: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: '继续处理' },
+        behaviors: [{ type: 'callback', value: {
+          action: 'completion_proposal_decide',
+          proposal_id: 'cp_0123456789abcdef0123456789abcdef',
+          decision: 'accept',
+        } }],
+      }] },
+    }));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toContain('callback');
+  });
+
   const card = {
     schema: '2.0',
     body: {
@@ -385,6 +418,78 @@ describe('normalizeInteractiveCardInput', () => {
 
     expect(res.ok).toBe(false);
     if (!res.ok) expect(res.error).toContain('callback');
+  });
+
+  it('accepts Card 2.0 callback behaviors only for the selected plugin', () => {
+    const raw = JSON.stringify({ schema: '2.0', body: { elements: [{
+      tag: 'button', text: { tag: 'plain_text', content: 'approve' },
+      behaviors: [{ type: 'callback', value: { action: 'example.approve' } }],
+    }] } });
+    const accepted = normalizeInteractiveCardInput(raw, {
+      callbackPolicy: { allowsAction: action => action === 'example.approve' },
+    });
+    expect(accepted.ok).toBe(true);
+    if (accepted.ok) expect(accepted.cardJson).toBe(raw);
+    expect(normalizeInteractiveCardInput(raw).ok).toBe(false);
+    expect(normalizeInteractiveCardInput(raw, {
+      callbackPolicy: { allowsAction: action => action === 'another.submit' },
+    }).ok).toBe(false);
+  });
+
+  it('accepts form callbacks only through an explicitly selected plugin action route', () => {
+    const pluginAction = 'example_plugin_review_submit';
+    const raw = JSON.stringify({
+      schema: '2.0',
+      body: {
+        elements: [{
+          tag: 'form',
+          name: 'review_form',
+          elements: [
+            {
+              tag: 'select_static',
+              name: 'finding_action',
+              options: [{ text: { tag: 'plain_text', content: 'fix' }, value: 'fix' }],
+            },
+            { tag: 'input', name: 'reason' },
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: 'submit' },
+              action_type: 'form_submit',
+              value: { action: pluginAction, request_id: 'request-1' },
+            },
+          ],
+        }],
+      },
+    });
+
+    const accepted = normalizeInteractiveCardInput(raw, {
+      callbackPolicy: { allowsAction: action => action === pluginAction },
+    });
+    expect(accepted.ok).toBe(true);
+
+    const denied = normalizeInteractiveCardInput(raw, {
+      callbackPolicy: { allowsAction: action => action === 'another_plugin_action' },
+    });
+    expect(denied.ok).toBe(false);
+    if (!denied.ok) expect(denied.error).toContain('callback');
+  });
+
+  it('keeps built-in key/root routing sealed in plugin-card mode', () => {
+    const res = normalizeInteractiveCardInput(JSON.stringify({
+      schema: '2.0',
+      body: {
+        elements: [{
+          tag: 'select_static',
+          options: [{ text: { tag: 'plain_text', content: 'x' }, value: 'x' }],
+          value: { action: 'example_plugin_action', key: 'repo_worktree' },
+        }],
+      },
+    }), {
+      callbackPolicy: { allowsAction: action => action === 'example_plugin_action' },
+    });
+
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toContain('value.key');
   });
 
   it('rejects value.key dropdowns (adopt/worktree namespace, not just value.action)', () => {
@@ -550,50 +655,6 @@ describe('sendVideoAttachments (best-effort media messages)', () => {
     expect(dispatch).toHaveBeenCalledWith(
       '{"file_key":"file:/tmp/replay.mp4","image_key":"image:/tmp/cover.png","duration":0}',
       'media',
-    );
-  });
-
-  it('passes deterministic UUIDs to primary and follow-up video dispatches', async () => {
-    const uploadFile = vi.fn(async (_app: string, p: string) => `file:${p}`);
-    const uploadImage = vi.fn(async (_app: string, p: string) => `image:${p}`);
-    const primaryDispatch = vi.fn(async (content: string) => `primary:${content}`);
-    const dispatch = vi.fn(async (content: string) => `plain:${content}`);
-    const providerUuid = vi.fn((
-      video: { videoPath: string },
-      index: number,
-      isPrimary: boolean,
-    ) => `bms_video_${index}_${isPrimary ? 'primary' : 'followup'}_${video.videoPath}`);
-
-    await sendVideoAttachments(
-      { uploadFile, uploadImage, dispatch, primaryDispatch, providerUuid },
-      'cli_app',
-      [
-        { videoPath: '/tmp/a.mp4', coverPath: '/tmp/a.png', durationMs: 0 },
-        { videoPath: '/tmp/b.mp4', coverPath: '/tmp/b.png', durationMs: 0 },
-      ],
-    );
-
-    expect(providerUuid).toHaveBeenNthCalledWith(
-      1,
-      { videoPath: '/tmp/a.mp4', coverPath: '/tmp/a.png', durationMs: 0 },
-      0,
-      true,
-    );
-    expect(providerUuid).toHaveBeenNthCalledWith(
-      2,
-      { videoPath: '/tmp/b.mp4', coverPath: '/tmp/b.png', durationMs: 0 },
-      1,
-      false,
-    );
-    expect(primaryDispatch).toHaveBeenCalledWith(
-      '{"file_key":"file:/tmp/a.mp4","image_key":"image:/tmp/a.png","duration":0}',
-      'media',
-      'bms_video_0_primary_/tmp/a.mp4',
-    );
-    expect(dispatch).toHaveBeenCalledWith(
-      '{"file_key":"file:/tmp/b.mp4","image_key":"image:/tmp/b.png","duration":0}',
-      'media',
-      'bms_video_1_followup_/tmp/b.mp4',
     );
   });
 
