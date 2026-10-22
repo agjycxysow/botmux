@@ -50,6 +50,9 @@ describe('logistics project Base projection', () => {
     expect(logisticsResolutionLabel('unknown')).toBe('未知');
     expect(logisticsResolutionLabel('unresolved')).toBe('未知');
     expect(LOGISTICS_PROJECT_BASE_FIELDS.find(field => field.name === '解决状态')?.options).toEqual(['已解决', '处理中', '未知']);
+    expect(LOGISTICS_PROJECT_BASE_FIELDS.find(field => field.name === 'LP')?.options)
+      .toEqual(['LP01', 'LP02', 'LP03', 'LP04', 'LP05', 'LP99']);
+    expect(fieldsForLogisticsProjectBase(row({ problemType: 'LP06' }), '物流 Bot').LP).toBe('');
   });
 
   it('builds Base v3 fields for every projection column', () => {

@@ -74,7 +74,7 @@ function isConfidence(value: unknown): value is LogisticsConfidence {
 }
 
 const BUSINESS_CATEGORY_IDS = new Set(['LB01', 'LB02', 'LB03', 'LB04', 'LB05', 'LB06', 'LB99']);
-const PROBLEM_TYPE_IDS = new Set(['LP01', 'LP02', 'LP03', 'LP04', 'LP05', 'LP06', 'LP07', 'LP99']);
+const PROBLEM_TYPE_IDS = new Set(['LP01', 'LP02', 'LP03', 'LP04', 'LP05', 'LP99']);
 
 function isResolutionStatus(value: unknown): value is LogisticsResolutionStatus {
   return value === 'resolved' || value === 'in_progress' || value === 'unknown';
@@ -300,7 +300,7 @@ export function buildLogisticsModelTaskPrompt(
     'JSON schema:',
     '{"businessCategory":"LB00","problemType":"LP00","resolutionStatus":"resolved|in_progress|unknown","overallConfidence":"high|medium|low","needsReview":true,"reviewReason":"最多 120 字"}',
     '业务分类只允许：LB01 电子面单/在线寄件，LB02 发货/履约，LB03 订单/售后/协商，LB04 物流工具/页面平台，LB05 数据/报表业务，LB06 研发与助手运行环境，LB99 其他/待复核。',
-    '问题类型只允许：LP01 规则或能力咨询，LP02 操作指导，LP03 页面/代码/接口链路定位，LP04 数据查询与分析，LP05 线上异常/故障排查，LP06 需求方案/研发协作，LP07 配置/权限/运行环境，LP99 其他/待复核。',
+    '问题类型只允许：LP01 前端埋点查询，LP02 业务数据查询，LP03 线上问题排查，LP04 业务功能咨询，LP05 商家反馈分析，LP99 其他。',
     '明确失败、无法完成或证据不足统一使用 unknown + needsReview=true；禁止输出 unresolved。',
     '解决状态不能仅由机器人 final、工具成功、会话停止或满意度推导。',
     '会话片段：',

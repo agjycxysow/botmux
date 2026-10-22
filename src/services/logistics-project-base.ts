@@ -27,7 +27,7 @@ export const LOGISTICS_PROJECT_BASE_FIELDS: LogisticsProjectBaseFieldSpec[] = [
   { name: '采集状态', type: 3, uiType: 'SingleSelect', options: ['完整', '部分', '待采集', '采集中', '缺少用户轮次', '缺少回答', '历史读取失败', '已跳过'] },
   { name: '打标状态', type: 3, uiType: 'SingleSelect', options: ['待采集', '打标中', '已完成', '待复核'] },
   { name: 'LB', type: 3, uiType: 'SingleSelect', options: ['LB01', 'LB02', 'LB03', 'LB04', 'LB05', 'LB06', 'LB99'] },
-  { name: 'LP', type: 3, uiType: 'SingleSelect', options: ['LP01', 'LP02', 'LP03', 'LP04', 'LP05', 'LP06', 'LP07', 'LP99'] },
+  { name: 'LP', type: 3, uiType: 'SingleSelect', options: ['LP01', 'LP02', 'LP03', 'LP04', 'LP05', 'LP99'] },
   { name: '解决状态', type: 3, uiType: 'SingleSelect', options: ['已解决', '处理中', '未知'] },
   { name: '业务 Reason Code', type: 1, uiType: 'Text' },
   { name: '问题 Reason Code', type: 1, uiType: 'Text' },
@@ -76,7 +76,7 @@ export interface LogisticsProjectBasePlan {
 }
 
 const BUSINESS = new Set(['LB01', 'LB02', 'LB03', 'LB04', 'LB05', 'LB06', 'LB99']);
-const PROBLEM = new Set(['LP01', 'LP02', 'LP03', 'LP04', 'LP05', 'LP06', 'LP07', 'LP99']);
+const PROBLEM = new Set(['LP01', 'LP02', 'LP03', 'LP04', 'LP05', 'LP99']);
 
 function captureStatus(row: LogisticsProjectBaseSourceRow): string {
   if (row.captureState === 'complete') return '完整';

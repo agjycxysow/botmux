@@ -37,7 +37,20 @@ botmux logistics analysis migrate --source /path/source-v5.sqlite --db /path/log
 
 迁移 dry-run 不创建目标库；apply 只调用冻结迁移接口写四表，旧 `conversation_labels` 不导入。不得把真实生产库、真实模型或 cron 安装作为本地自测步骤。
 
-小时 cron 样例是 `scripts/logistics-analysis-hourly.sh`。脚本从自身目录反推 worktree，要求已存在 `dist/cli.js`，默认执行 `node "$WORKTREE/dist/cli.js" logistics analysis run --apply`（可用 `BOTMUX_LOGISTICS_ANALYSIS_NODE` 指定 Node），要求设置 `BOTMUX_LOGISTICS_ANALYSIS_DB`、`BOTMUX_LOGISTICS_ANALYSIS_BOT`、`BOTMUX_LOGISTICS_ANALYSIS_HARNESS_ROOT`，并用 `flock -n` 在上一轮未结束时跳过。建议每小时第 5 分钟调用；本文件不代表已经安装 cron。
+小时 cron 样例是 `scripts/logistics-analysis-hourly.sh`。脚本从自身目录反推 worktree，要求已存在 `dist/cli.js`，默认先执行 `node "$WORKTREE/dist/cli.js" logistics analysis run --apply`，再执行 `logistics-reviewed-report.mjs check-source` 对全部根话题和完整线程做覆盖校验（可用 `BOTMUX_LOGISTICS_ANALYSIS_NODE` 指定 Node）。脚本要求设置 `BOTMUX_LOGISTICS_ANALYSIS_DB`、`BOTMUX_LOGISTICS_ANALYSIS_BOT`、`BOTMUX_LOGISTICS_ANALYSIS_HARNESS_ROOT`，并用 `flock -n` 在上一轮未结束时跳过。覆盖校验不完整时退出码为 2，当前正式统计保持 HTTP 409。建议每小时第 5 分钟调用；本文件不代表已经安装 cron。
+
+当前 LP revision 只允许 `LP01 前端埋点查询`、`LP02 业务数据查询`、`LP03 线上问题排查`、`LP04 业务功能咨询`、`LP05 商家反馈分析`、`LP99 其他`。标签按 `session_key + content_hash + capture_version + labeler_revision` 唯一保存和读取，旧 revision 不覆盖，也不参与当前 revision 聚合。
+
+正式解决率来自不可变复核批次。先对 payload 做 dry-run；只有完整覆盖、逐话题分类和复核都完成后才允许导入：
+
+```bash
+node scripts/logistics-reviewed-report.mjs import --db /path/logistics-analysis.sqlite --payload /path/review.json
+node scripts/logistics-reviewed-report.mjs import --db /path/logistics-analysis.sqlite --payload /path/review.json --apply --receipt /path/receipt.json
+node scripts/logistics-reviewed-report.mjs check-source --db /path/logistics-analysis.sqlite
+node scripts/logistics-reviewed-report.mjs report --db /path/logistics-analysis.sqlite
+```
+
+写入前必须确认小时 `flock` 和 `<db>.analysis-job.lock` 都已释放。apply 使用 SQLite 一致性备份并记录 SHA-256，随后执行完整性和外键检查。有效话题解决率为 `resolved / (resolved + in_progress + unknown)`；`invalid` 排除。当前覆盖缺失、来源变化、待分类或待复核时，实时 API 返回 `analysis_report_incomplete`/HTTP 409；显式 `asOf` 只读取已验证的历史批次。
 
 run 状态文件位于 `<db>.run.json`，原子写入且权限为 0600，只包含非敏感运行元数据。例如：
 

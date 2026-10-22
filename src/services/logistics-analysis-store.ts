@@ -14,7 +14,7 @@ import {
 
 const require = createRequire(import.meta.url);
 
-export const LOGISTICS_ANALYSIS_SCHEMA_VERSION = 1;
+export const LOGISTICS_ANALYSIS_SCHEMA_VERSION = 3;
 export const LOGISTICS_ANALYSIS_DEFAULT_LIST_LIMIT = 50;
 export const LOGISTICS_ANALYSIS_MAX_LIST_LIMIT = 200;
 export const LOGISTICS_ANALYSIS_MAX_LABEL_ATTEMPTS = 3;
@@ -280,6 +280,17 @@ export interface LogisticsAnalysisSummary {
   unknown: number;
   needsReview: number;
   lastDataTime: number | null;
+  categories: LogisticsAnalysisCategorySummary[];
+}
+
+export interface LogisticsAnalysisCategorySummary {
+  taskType: string;
+  name: string;
+  topicCount: number;
+  resolvedCount: number;
+  inProgressCount: number;
+  unknownCount: number;
+  resolutionRate: number | null;
 }
 
 export interface LogisticsAnalysisTrendPoint {
@@ -329,7 +340,11 @@ export interface LogisticsAnalysisDetail extends LogisticsAnalysisListItem {
 type SqlValue = string | number | null;
 type QueryRow = Record<string, unknown>;
 
-const TABLES = new Set(['sessions', 'messages', 'labels', 'label_runs']);
+const TABLES = new Set([
+  'sessions', 'messages', 'labels', 'label_runs',
+  'logistics_review_batches', 'logistics_review_topics',
+]);
+const REQUIRED_TABLES = new Set(['sessions', 'messages', 'labels', 'label_runs']);
 const CAPTURE_STATUSES = new Set<LogisticsAnalysisCaptureStatus>([
   'pending', 'running', 'captured', 'partial', 'failed', 'conflict',
 ]);
@@ -343,7 +358,15 @@ const SOURCES = new Set<LogisticsAnalysisMessageSource>([
   'lark_history', 'botmux_send_marker', 'codex_rollout', 'legacy',
 ]);
 const BUSINESS_LABELS = new Set(['LB01', 'LB02', 'LB03', 'LB04', 'LB05', 'LB06', 'LB99']);
-const PROBLEM_LABELS = new Set(['LP01', 'LP02', 'LP03', 'LP04', 'LP05', 'LP06', 'LP07', 'LP99']);
+const PROBLEM_LABELS = new Set(['LP01', 'LP02', 'LP03', 'LP04', 'LP05', 'LP99']);
+const PROBLEM_LABEL_NAMES: Record<string, string> = {
+  LP01: '前端埋点查询',
+  LP02: '业务数据查询',
+  LP03: '线上问题排查',
+  LP04: '业务功能咨询',
+  LP05: '商家反馈分析',
+  LP99: '其他',
+};
 
 function required(value: string | null | undefined, name: string): string {
   const normalized = value?.trim() ?? '';
@@ -567,6 +590,32 @@ export class LogisticsAnalysisStore {
     if (version > LOGISTICS_ANALYSIS_SCHEMA_VERSION) {
       throw new Error(`analysis_schema_version_unsupported:${version}`);
     }
+    const labelsSql = (this.db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='labels'",
+    ).get() as { sql?: string } | undefined)?.sql ?? '';
+    if (labelsSql.includes('session_key TEXT PRIMARY KEY')) {
+      this.db.exec(`
+        BEGIN IMMEDIATE;
+        ALTER TABLE labels RENAME TO labels_v2;
+        CREATE TABLE labels (
+          session_key TEXT NOT NULL REFERENCES sessions(session_key) ON DELETE CASCADE,
+          content_hash TEXT NOT NULL,
+          labeler_revision TEXT NOT NULL,
+          labeled_at INTEGER NOT NULL,
+          lb TEXT NOT NULL,
+          lp TEXT NOT NULL,
+          resolution_status TEXT NOT NULL CHECK(resolution_status IN ('resolved','in_progress','unknown')),
+          confidence TEXT NOT NULL CHECK(confidence IN ('high','medium','low')),
+          needs_review INTEGER NOT NULL CHECK(needs_review IN (0,1)),
+          label_reason TEXT,
+          capture_version INTEGER NOT NULL,
+          PRIMARY KEY(session_key,content_hash,capture_version,labeler_revision)
+        );
+        INSERT INTO labels SELECT * FROM labels_v2;
+        DROP TABLE labels_v2;
+        COMMIT;
+      `);
+    }
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         session_key TEXT PRIMARY KEY,
@@ -612,7 +661,7 @@ export class LogisticsAnalysisStore {
         WHERE platform_message_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS messages_session_time ON messages(session_key,occurred_at,message_key);
       CREATE TABLE IF NOT EXISTS labels (
-        session_key TEXT PRIMARY KEY REFERENCES sessions(session_key) ON DELETE CASCADE,
+        session_key TEXT NOT NULL REFERENCES sessions(session_key) ON DELETE CASCADE,
         content_hash TEXT NOT NULL,
         labeler_revision TEXT NOT NULL,
         labeled_at INTEGER NOT NULL,
@@ -622,7 +671,8 @@ export class LogisticsAnalysisStore {
         confidence TEXT NOT NULL CHECK(confidence IN ('high','medium','low')),
         needs_review INTEGER NOT NULL CHECK(needs_review IN (0,1)),
         label_reason TEXT,
-        capture_version INTEGER NOT NULL
+        capture_version INTEGER NOT NULL,
+        PRIMARY KEY(session_key,content_hash,capture_version,labeler_revision)
       );
       CREATE INDEX IF NOT EXISTS labels_revision ON labels(labeler_revision,content_hash);
       CREATE TABLE IF NOT EXISTS label_runs (
@@ -649,7 +699,7 @@ export class LogisticsAnalysisStore {
       "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
     ).all() as Array<{ name: string }>).map(row => row.name);
     const unsupported = existing.filter(name => !TABLES.has(name));
-    if (unsupported.length || !existing.every(name => TABLES.has(name)) || existing.length !== TABLES.size) {
+    if (unsupported.length || [...REQUIRED_TABLES].some(name => !existing.includes(name))) {
       throw new Error(`analysis_database_not_four_table:${unsupported.join(',') || 'missing_table'}`);
     }
   }
@@ -1292,8 +1342,7 @@ export class LogisticsAnalysisStore {
           session_key,content_hash,labeler_revision,labeled_at,lb,lp,resolution_status,
           confidence,needs_review,label_reason,capture_version
         ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(session_key) DO UPDATE SET
-          content_hash=excluded.content_hash,labeler_revision=excluded.labeler_revision,
+        ON CONFLICT(session_key,content_hash,capture_version,labeler_revision) DO UPDATE SET
           labeled_at=excluded.labeled_at,lb=excluded.lb,lp=excluded.lp,
           resolution_status=excluded.resolution_status,confidence=excluded.confidence,
           needs_review=excluded.needs_review,label_reason=excluded.label_reason,
@@ -1452,6 +1501,19 @@ export class LogisticsAnalysisStore {
       const count = (predicate: (row: QueryRow) => boolean) => rows.filter(predicate).length;
       const labeled = count(row => String(row.label_status) === 'labeled');
       const resolved = count(row => String(row.label_status) === 'labeled' && row.resolution_status === 'resolved');
+      const categories = Object.entries(PROBLEM_LABEL_NAMES).map(([taskType, name]) => {
+        const categoryRows = rows.filter(row => String(row.label_status) === 'labeled' && row.lp === taskType);
+        const resolvedCount = categoryRows.filter(row => row.resolution_status === 'resolved').length;
+        return {
+          taskType,
+          name,
+          topicCount: categoryRows.length,
+          resolvedCount,
+          inProgressCount: categoryRows.filter(row => row.resolution_status === 'in_progress').length,
+          unknownCount: categoryRows.filter(row => row.resolution_status === 'unknown').length,
+          resolutionRate: categoryRows.length ? resolvedCount / categoryRows.length : null,
+        };
+      });
       return {
         totalTopics: rows.length,
         capturedTopics: count(row => row.capture_status === 'captured'),
@@ -1473,6 +1535,7 @@ export class LogisticsAnalysisStore {
           const value = numberOrNull(row.updated_at);
           return value === null ? latest : latest === null ? value : Math.max(latest, value);
         }, null),
+        categories,
       };
     });
   }

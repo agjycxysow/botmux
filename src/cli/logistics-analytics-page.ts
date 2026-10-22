@@ -127,7 +127,7 @@ export function renderLogisticsAnalyticsPage(): string {
       <div>
         <p class="eyebrow">READ-ONLY ANALYTICS</p>
         <h1>物流专家 · 会话概览</h1>
-        <p class="subtitle">一个飞书话题对应一个问题；只展示采集、打标和业务状态。</p>
+        <p class="subtitle">按根话题主要目标统计；当前口径固定为六类，未知状态保留在解决率分母。</p>
       </div>
       <section class="run-summary" aria-live="polite" id="run-summary">
         <strong>调度状态</strong>
@@ -154,6 +154,16 @@ export function renderLogisticsAnalyticsPage(): string {
 
     <div class="state" id="state" aria-live="polite"></div>
     <section class="metrics" id="metrics" aria-label="概览计数"></section>
+
+    <section class="panel table-panel">
+      <div class="panel-header"><h2>六类解决率</h2><span>unknown 和进行中进入分母，invalid 排除</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>分类</th><th>话题数</th><th>已解决</th><th>进行中</th><th>未知</th><th>解决率</th></tr></thead>
+          <tbody id="category-summary"></tbody>
+        </table>
+      </div>
+    </section>
 
     <section class="grid">
       <article class="panel">
@@ -200,9 +210,8 @@ export function renderLogisticsAnalyticsPage(): string {
         LB04: '物流工具 / 页面平台', LB05: '数据 / 报表业务', LB06: '研发与助手运行环境', LB99: '其他 / 待复核'
       },
       lp: {
-        LP01: '规则或能力咨询', LP02: '操作指导', LP03: '页面 / 代码 / 接口链路定位',
-        LP04: '数据查询与分析', LP05: '线上异常 / 故障排查', LP06: '需求方案 / 研发协作',
-        LP07: '配置 / 权限 / 运行环境', LP99: '其他 / 待复核'
+        LP01: '前端埋点查询', LP02: '业务数据查询', LP03: '线上问题排查',
+        LP04: '业务功能咨询', LP05: '商家反馈分析', LP99: '其他'
       }
     };
     const RESOLUTION = { resolved: '已解决', in_progress: '进行中', unknown: '未知' };
@@ -329,6 +338,23 @@ export function renderLogisticsAnalyticsPage(): string {
         card.appendChild(make('strong', 'value', formatNumber(item[1])));
         if (item[2]) card.appendChild(make('span', 'detail', item[2]));
         metrics.appendChild(card);
+      });
+    }
+
+    function renderCategories(rows) {
+      const body = document.getElementById('category-summary');
+      body.textContent = '';
+      (rows || []).forEach(row => {
+        const tr = document.createElement('tr');
+        [
+          formatCode('lp', row.taskType),
+          formatNumber(row.topicCount),
+          formatNumber(row.resolvedCount),
+          formatNumber(row.inProgressCount),
+          formatNumber(row.unknownCount),
+          row.resolutionRate === null ? '—' : (Number(row.resolutionRate) * 100).toFixed(1) + '%'
+        ].forEach(value => tr.appendChild(make('td', '', value)));
+        body.appendChild(tr);
       });
     }
 
@@ -481,6 +507,7 @@ export function renderLogisticsAnalyticsPage(): string {
         ]);
         if (serial !== loadSerial) return;
         renderMetrics(results[0]);
+        renderCategories(results[0].categories);
         renderTrend(results[1]);
         renderDistribution(document.getElementById('lb-distribution'), results[2].lb, 'lb');
         renderDistribution(document.getElementById('lp-distribution'), results[2].lp, 'lp');

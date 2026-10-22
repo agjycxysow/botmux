@@ -291,6 +291,121 @@ describe('four-table logistics analysis store', () => {
     store.close();
   });
 
+  it('preserves labels from older revisions and computes all six category denominators', async () => {
+    const { store, sessionKey, contentHash } = await capturedStore();
+    for (const [labelerRevision, lp, resolutionStatus] of [
+      ['revision-old', 'LP04', 'resolved'],
+      ['revision-new', 'LP99', 'unknown'],
+    ] as const) {
+      const run = store.registerLabelRun({ sessionKey, contentHash, labelerRevision, now: Date.now() });
+      store.commitLabel({
+        runId: run.runId,
+        sessionKey,
+        contentHash,
+        labelerRevision,
+        lb: 'LB02',
+        lp,
+        resolutionStatus,
+        confidence: resolutionStatus === 'unknown' ? 'low' : 'high',
+        needsReview: resolutionStatus === 'unknown',
+      });
+    }
+    expect(store.list({ labelerRevision: 'revision-old' }).items[0]).toMatchObject({
+      lp: 'LP04',
+      resolutionStatus: 'resolved',
+    });
+    const current = store.summary({ labelerRevision: 'revision-new' });
+    expect(current.categories).toHaveLength(6);
+    expect(current.categories.find(row => row.taskType === 'LP99')).toMatchObject({
+      topicCount: 1,
+      resolvedCount: 0,
+      inProgressCount: 0,
+      unknownCount: 1,
+      resolutionRate: 0,
+    });
+    const db = new DatabaseSync(store.path, { readOnly: true });
+    expect((db.prepare('SELECT COUNT(*) AS count FROM labels WHERE session_key=?').get(sessionKey) as { count: number }).count)
+      .toBe(2);
+    db.close();
+    store.close();
+  });
+
+  it('migrates the production v2 labels primary key without losing the historical label', async () => {
+    const { dataDir, store, sessionKey, contentHash } = await capturedStore();
+    const oldRun = store.registerLabelRun({
+      sessionKey,
+      contentHash,
+      labelerRevision: 'revision-old',
+      now: 4_000,
+    });
+    store.commitLabel({
+      runId: oldRun.runId,
+      sessionKey,
+      contentHash,
+      labelerRevision: 'revision-old',
+      lb: 'LB02',
+      lp: 'LP04',
+      resolutionStatus: 'resolved',
+      confidence: 'high',
+      needsReview: false,
+    });
+    const path = store.path;
+    store.close();
+
+    const v2 = new DatabaseSync(path);
+    v2.exec(`
+      ALTER TABLE labels RENAME TO labels_v3;
+      CREATE TABLE labels (
+        session_key TEXT PRIMARY KEY REFERENCES sessions(session_key) ON DELETE CASCADE,
+        content_hash TEXT NOT NULL,
+        labeler_revision TEXT NOT NULL,
+        labeled_at INTEGER NOT NULL,
+        lb TEXT NOT NULL,
+        lp TEXT NOT NULL,
+        resolution_status TEXT NOT NULL CHECK(resolution_status IN ('resolved','in_progress','unknown')),
+        confidence TEXT NOT NULL CHECK(confidence IN ('high','medium','low')),
+        needs_review INTEGER NOT NULL CHECK(needs_review IN (0,1)),
+        label_reason TEXT,
+        capture_version INTEGER NOT NULL
+      );
+      INSERT INTO labels SELECT * FROM labels_v3;
+      DROP TABLE labels_v3;
+      PRAGMA user_version=2;
+    `);
+    v2.close();
+
+    const migrated = new LogisticsAnalysisStore({ dataDir, path });
+    expect(migrated.list({ labelerRevision: 'revision-old' }).items[0]).toMatchObject({
+      lp: 'LP04',
+      resolutionStatus: 'resolved',
+    });
+    const newRun = migrated.registerLabelRun({
+      sessionKey,
+      contentHash,
+      labelerRevision: 'revision-new',
+      now: 5_000,
+    });
+    migrated.commitLabel({
+      runId: newRun.runId,
+      sessionKey,
+      contentHash,
+      labelerRevision: 'revision-new',
+      lb: 'LB02',
+      lp: 'LP99',
+      resolutionStatus: 'unknown',
+      confidence: 'low',
+      needsReview: true,
+    });
+    const db = new DatabaseSync(path, { readOnly: true });
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 3 });
+    expect((db.prepare('SELECT COUNT(*) AS count FROM labels WHERE session_key=?').get(sessionKey) as { count: number }).count)
+      .toBe(2);
+    expect(db.prepare('PRAGMA integrity_check').get()).toEqual({ integrity_check: 'ok' });
+    expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+    db.close();
+    migrated.close();
+  });
+
   it('keeps summary, trend, distributions, detail, and pagination read-only and consistent', async () => {
     const dataDir = await tempDir();
     const writable = new LogisticsAnalysisStore({ dataDir });

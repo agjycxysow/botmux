@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 import { resolveLogisticsHarnessRevision } from '../services/logistics-session-model-task.js';
+import { reviewedApi } from '../services/logistics-reviewed-report.js';
 import {
   LogisticsAnalysisStore,
   type LogisticsAnalysisCaptureStatus,
@@ -22,6 +23,7 @@ export interface LogisticsAnalyticsServerOptions {
   port?: number;
   accessToken?: string;
   labelerRevision?: string;
+  defaultChatId?: string;
 }
 
 type AnalyticsRunStatus = 'running' | 'succeeded' | 'partial' | 'failed';
@@ -330,6 +332,8 @@ export function createLogisticsAnalyticsServer(options: LogisticsAnalyticsServer
     if (!authorized(req, url, options.accessToken)) return unauthorized(res);
     if (options.accessToken && exchangeQueryToken(req, res, url)) return;
     try {
+      const reviewed = reviewedApi(databasePath, url, options.defaultChatId);
+      if (reviewed) return sendJson(res, reviewed.status, reviewed.body);
       if (url.pathname === '/favicon.ico') {
         res.writeHead(204, { 'cache-control': 'no-store' });
         return res.end();
@@ -410,7 +414,15 @@ export async function runLogisticsAnalyticsCommand(sub: string, args: string[], 
   if (host !== '127.0.0.1' && host !== '::1' && !accessToken) {
     throw new Error('BOTMUX_ANALYTICS_TOKEN is required when binding beyond loopback');
   }
-  const server = createLogisticsAnalyticsServer({ dataDir, databasePath, host, port, accessToken, labelerRevision });
+  const server = createLogisticsAnalyticsServer({
+    dataDir,
+    databasePath,
+    host,
+    port,
+    accessToken,
+    labelerRevision,
+    defaultChatId: process.env.BOTMUX_ANALYTICS_DEFAULT_CHAT_ID?.trim() || undefined,
+  });
   await new Promise<void>((resolvePromise, reject) => {
     server.once('error', reject);
     server.listen(port, host, () => {

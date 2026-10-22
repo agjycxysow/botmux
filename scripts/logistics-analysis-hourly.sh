@@ -28,4 +28,6 @@ if [[ -n "${BOTMUX_LOGISTICS_ANALYSIS_MODEL:-}" ]]; then
   args+=(--model "$BOTMUX_LOGISTICS_ANALYSIS_MODEL")
 fi
 
-exec "$NODE_BIN" "$WORKTREE/dist/cli.js" "${args[@]}"
+"$NODE_BIN" "$WORKTREE/dist/cli.js" "${args[@]}"
+"$NODE_BIN" "$WORKTREE/scripts/logistics-reviewed-report.mjs" check-source \
+  --db "$BOTMUX_LOGISTICS_ANALYSIS_DB"

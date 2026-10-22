@@ -218,7 +218,8 @@ describe('standalone logistics analytics v1 server', () => {
     expect(htmlText).toContain('物流专家 · 会话概览');
     expect(htmlText).toContain('标签处理状态');
     expect(htmlText).toContain('全部历史');
-    for (const forbidden of ['解决率', '满意度', '问卷', '人效', '人工改标', '原话题']) {
+    expect(htmlText).toContain('六类解决率');
+    for (const forbidden of ['满意度', '问卷', '人效', '人工改标', '原话题']) {
       expect(htmlText).not.toContain(forbidden);
     }
 

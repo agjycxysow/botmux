@@ -64,11 +64,11 @@ describe('logistics session model task', () => {
   it('accepts only the established LB/LP taxonomy and discrete resolution states', () => {
     expect(parseLogisticsModelTaskOutput(JSON.stringify({
       businessCategory: 'LB02',
-      problemType: 'LP03',
+      problemType: 'LP04',
       resolutionStatus: 'resolved',
       overallConfidence: 'medium',
       needsReview: false,
-    }))).toMatchObject({ businessCategory: 'LB02', problemType: 'LP03' });
+    }))).toMatchObject({ businessCategory: 'LB02', problemType: 'LP04' });
     expect(() => parseLogisticsModelTaskOutput(JSON.stringify({
       businessCategory: 'LB77',
       problemType: 'LP03',
@@ -86,15 +86,15 @@ describe('logistics session model task', () => {
       harness_revision: 'a'.repeat(64),
       capture_state: 'complete',
       business: { id: 'LB02', confidence: 'high', reason_code: 'primary_domain_fulfillment', evidence_anchors: [{ role: 'domain', message_index: 0 }] },
-      problem_type: { id: 'LP03', confidence: 'high', reason_code: 'code_or_api_trace_requested', evidence_anchors: [{ role: 'goal', message_index: 0 }] },
-      resolution: { status: 'resolved', confidence: 'high', reason_code: 'requested_trace_delivered', evidence_anchors: [{ role: 'goal', message_index: 0 }, { role: 'outcome', message_index: 1 }] },
+      problem_type: { id: 'LP04', confidence: 'high', reason_code: 'business_capability_consultation_requested', evidence_anchors: [{ role: 'goal', message_index: 0 }] },
+      resolution: { status: 'resolved', confidence: 'high', reason_code: 'business_capability_answer_delivered', evidence_anchors: [{ role: 'goal', message_index: 0 }, { role: 'outcome', message_index: 1 }] },
       needs_review: false,
       review_reason: '',
       manual_review: { status: 'pending' },
     }));
     expect(harness).toMatchObject({
       businessCategory: 'LB02',
-      problemType: 'LP03',
+      problemType: 'LP04',
       resolutionStatus: 'resolved',
       harnessRevision: 'a'.repeat(64),
       businessReasonCode: 'primary_domain_fulfillment',
@@ -230,15 +230,15 @@ describe('logistics session model task', () => {
             evidence_anchors: [{ role: 'domain', message_index: 0 }],
           },
           problem_type: {
-            id: 'LP03',
+            id: 'LP04',
             confidence: 'high',
-            reason_code: 'code_or_api_trace_requested',
+            reason_code: 'business_capability_consultation_requested',
             evidence_anchors: [{ role: 'goal', message_index: 0 }],
           },
           resolution: {
             status: 'resolved',
             confidence: 'high',
-            reason_code: 'requested_trace_delivered',
+            reason_code: 'business_capability_answer_delivered',
             evidence_anchors: [{ role: 'outcome', message_index: 1 }],
           },
           needs_review: false,
