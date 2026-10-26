@@ -35,6 +35,7 @@
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { renderEcopIdentityWrapper } from './ecop-cli-identity.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
 import { isCliIdentityPath } from '../utils/child-env.js';
 import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/trigger-user-auth.js';
@@ -194,7 +195,8 @@ function assertSafeSegment(value: string): string {
  * scope or dashboard surface has to learn a third name.
  */
 export const CODEBASE_COMPANION_TOOL = 'codebase' as const;
-export type IdentityTool = TriggerUserAuthTool | typeof CODEBASE_COMPANION_TOOL;
+export const ECOP_COMPANION_TOOL = 'ecop' as const;
+export type IdentityTool = TriggerUserAuthTool | typeof CODEBASE_COMPANION_TOOL | typeof ECOP_COMPANION_TOOL;
 
 export const IDENTITY_ENV_KEYS: Record<IdentityTool, readonly string[]> = {
   // APP_SECRET appears only in bot mode; in user mode it is absent from the
@@ -206,12 +208,17 @@ export const IDENTITY_ENV_KEYS: Record<IdentityTool, readonly string[]> = {
   // The Codebase CLI reads the same Codebase JWT from its own variable
   // (`codebase auth login --help`: CI usage without persisting credentials).
   codebase: ['CODEBASE_CLI_USER_JWT'],
+  // ECOP reads the bytedcli record directly; it never gets a second JWT file.
+  ecop: ['USER_CLOUD_JWT'],
 };
 
 /** The identity tools a policy actually governs (policy tools + companions). */
 export function identityToolsFor(tools: readonly TriggerUserAuthTool[]): IdentityTool[] {
   const out = new Set<IdentityTool>(tools);
-  if (out.has('bytedcli')) out.add(CODEBASE_COMPANION_TOOL);
+  if (out.has('bytedcli')) {
+    out.add(CODEBASE_COMPANION_TOOL);
+    out.add(ECOP_COMPANION_TOOL);
+  }
   return [...out];
 }
 
@@ -556,6 +563,7 @@ export function clearAllSessionIdentities(sessionDataDir: string, sessionId: str
  *    is recoverable, a command that silently ran as the wrong person is not.
  */
 export function renderIdentityWrapper(tool: IdentityTool, realBinaryPath: string): string {
+  if (tool === ECOP_COMPANION_TOOL) return renderEcopIdentityWrapper(realBinaryPath);
   const exportKeys = IDENTITY_ENV_KEYS[tool].join(' ');
   return [
     '#!/bin/sh',
@@ -678,7 +686,8 @@ export function ensureSessionIdentityPlaceholders(
 ): void {
   mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
   const paths = [
-    ...tools.map(tool => sessionIdentityPath(sessionDataDir, sessionId, tool)),
+    ...new Set(tools.map(tool => sessionIdentityPath(sessionDataDir, sessionId,
+      tool === ECOP_COMPANION_TOOL ? 'bytedcli' : tool))),
     // Same existence-filter reason: the wrapper reads the active turn on every
     // invocation, and a path missing at spawn stays unreadable afterwards.
     sessionActiveTurnPath(sessionDataDir, sessionId),
@@ -973,8 +982,22 @@ export function prepareTriggerUserCliEnv(
     try {
       const real = findRealToolBinary(tool, childEnv.PATH, [wrapperDir]);
       if (!real) {
-        log(`[trigger-user-auth] ${tool} is not installed; no wrapper written`);
+        if (tool === ECOP_COMPANION_TOOL) {
+          // A later PATH install must not expose a bare, ungoverned ECOP CLI.
+          mkdirSync(wrapperDir, { recursive: true, mode: 0o700 });
+          atomicWriteFileSync(join(wrapperDir, tool),
+            "#!/bin/sh\nprintf '%s\\n' 'botmux: ecop CLI is not installed; install it and recreate the session.' >&2\nexit 127\n",
+            { mode: 0o755 });
+          installedAny = true;
+          log('[trigger-user-auth] ecop is not installed; installed a refusing wrapper');
+        } else {
+          log(`[trigger-user-auth] ${tool} is not installed; no wrapper written`);
+        }
         continue;
+      }
+      if (tool === ECOP_COMPANION_TOOL) {
+        // Pre-create before the sandbox existence-filters its writable grants.
+        mkdirSync(join(sessionDataDir, 'ecop-runtime', assertSafeSegment(sessionId)), { recursive: true, mode: 0o700 });
       }
       installIdentityWrapper(wrapperDir, tool, real);
       installedAny = true;
@@ -982,6 +1005,8 @@ export function prepareTriggerUserCliEnv(
     } catch (e) {
       // A missing wrapper means the tool keeps its previous behavior; it must
       // not stop the session from starting.
+      // A discovered ECOP tool must never silently run with host credentials.
+      if (tool === ECOP_COMPANION_TOOL) throw e;
       log(`[trigger-user-auth] WARN could not wrap ${tool}: ${(e as Error).message}`);
     }
   }

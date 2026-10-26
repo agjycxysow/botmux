@@ -21403,6 +21403,7 @@ async function spawnCli(
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         childEnvForce: { CODEX_HOME: nativeCodexHome, TRAE_HOME: nativeTraeHome },
         readOnlyCarvePaths: scratchReadOnlyCarves,
+        writableCarvePaths: (scratchSecrets.writableCarvePaths ?? []).map(scratchCanonical),
         useBwrapArgsFile: effectiveBackendType === 'tmux',
       });
       if (!sbx) {
