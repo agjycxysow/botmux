@@ -20248,7 +20248,7 @@ async function spawnCli(
   // build can't read bots.json (Seatbelt-denied) → `botmux send` fails "Bot not registered".
   // (The tmux backend re-prepends this in its pane script after rcfile load; this covers the
   // pty/direct-spawn path, whose child inherits childEnv.PATH directly.)
-  childEnv.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), childEnv.PATH);
+  childEnv.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), perBotInjectEnv.PATH ?? childEnv.PATH);
   if (!boundLark) {
     delete childEnv.BOTMUX_LARK_TOOL_BINDING;
   }
