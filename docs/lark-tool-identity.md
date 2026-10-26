@@ -36,7 +36,7 @@ Botmux 提供的短期 bot token。
 - 已绑定的机器**不再自动发起本机扫码**：拒绝消息直接给平台凭据页链接。`auto` 模式下显式的 `/login lark` / `/login bytedcli` 仍可走本机扫码作为兜底；`platform` 模式下它们也只给平台链接。
 - 平台地址来自 `~/.botmux/platform.json`（`botmux bind` 写入），源码不含任何部署专属域名。
 - **codebase-cli 随 bytedcli**：Codebase CLI 读的是 bytedcli 派生的 Codebase JWT（`CODEBASE_CLI_USER_JWT`），所以它不单独授权：bytedcli 的身份一发布，`codebase` 的身份文件与 wrapper 就一起生成；bytedcli 被拒或拿不到 Codebase JWT 时，`codebase` 同样被拒，不会退回机器自己的 Codebase 登录。平台凭据页上它显示为随 bytedcli 的状态。
-- **ecop 随 bytedcli**：`ecop` 包装器直接读取本轮 bytedcli 身份记录，校验发送人、回合与 JWT 有效期，只向本次子进程注入 `USER_CLOUD_JWT`。需要 Node.js 22+ 和已安装的 ecop CLI；不新增平台授权或配置开关。隔离缓存位于 `ecop-runtime/<session>/<caller>/<environment>`，未授权或身份不一致直接拒绝。受管模式禁止覆盖 JWT、使用附身命令或另起 SSO；不要让 Agent 读取凭证、绕过入口或升级固定版本。`auth status` 只读缓存，实际身份应通过受管 `login --json` 的服务端用户信息验证。macOS scratch 模式尚未验证，不能据此声称可用。
+- **ecop 随 bytedcli**：`ecop` 包装器复用本轮 bytedcli 身份：single 模式读取当轮文件，proven 模式经已有进程证明通道取回内存凭证，证明失败不回退读文件；校验发送人、回合与 JWT 有效期，只向本次子进程注入 `USER_CLOUD_JWT`。需要 Node.js 22+ 和已安装的 ecop CLI；不新增平台授权或配置开关。隔离缓存位于 `ecop-runtime/<session>/<caller>/<environment>`，未授权或身份不一致直接拒绝。受管模式禁止覆盖 JWT、使用附身命令或另起 SSO；不要让 Agent 读取凭证、绕过入口或升级固定版本。`auth status` 只读缓存，实际身份应通过受管 `login --json` 的服务端用户信息验证。macOS scratch 模式尚未验证，不能据此声称可用。
 - 平台按「发送人与本机所有者至少同属一个团队」且「发送人已对该团队开启同意」签发；不满足时分别返回 `not_teammate` / `consent_missing`，botmux 原样告知发送人，不退回任何其他身份。
 - **绑定会话（`larkToolBinding` 默认开启）里的 `--as user` 同样会用平台凭据。** 自建 bot 应用的可用范围通常只有所有者本人，别人打开该应用的授权链接只会看到「你没有使用权限」，所以对他们来说平台是唯一可用的来源。取法：
   - `auto`：该人已有对本 bot 应用的授权就用它（所有者保留 bot 应用更多的权限）；没有则向平台申请，lark-cli 的用户调用改用平台应用的 app id 执行；机器未绑定平台时与以前一致。
@@ -44,6 +44,7 @@ Botmux 提供的短期 bot token。
   - `local`，或 `triggerUserAuth` 未覆盖 lark-cli：与以前一致，只用对 bot 应用的授权。
   - `--as bot` 始终是本 bot 应用，不受影响；只有 daemon 明确标注为平台签发的用户票，lark-cli 包装器才接受与绑定应用不同的 app id。
   - 这种情况下 `botmux auth request` 不再发 bot 应用的设备码链接，而是返回 `platform_authorization_required` 与平台凭据页地址；平台应用缺某个权限时，需要先在平台应用后台开通，再让用户在平台重新授权。
+  - 平台应用拿不到某些敏感权限（例如以用户身份读群聊/私聊消息，全员可见的应用通常批不下来）时，数据若在本 bot 能访问的群或文档里，提示会先引导模型对这次**读取**改用 `--as bot`，再考虑补权限；写操作不改用 bot 身份。执行者由模型在命令里显式选择，包装器不会自动换身份重试。
 
 ## 使用
 
@@ -68,12 +69,13 @@ bot 读取失败后，agent 可根据任务与错误尝试 user。包装器不�
 
 - 默认开启（未配置或显式开启）。已接入的会话恢复或重启时重新评估配置。
 - 当关闭该配置并重启（`/restart`）或恢复时，自动清理会话目录下的 `lark-tool-binding.json`、`lark-config/` 及托管包装脚本 `binDir/lark-cli`，且不会误伤 `triggerUserAuth` 包装脚本（如 `bytedcli` 或 trigger-user `lark-cli`）或其它文件。
+- 绑定入口与 `triggerUserAuth` 包装脚本共用同一个 `binDir`，绑定会话不论是否开启按触发人鉴权都会把它放到 PATH 最前面。因此 `triggerUserAuth` 关闭（或不再覆盖某个工具）时，该工具的 trigger-user 包装脚本必须移除，否则它会继续拦截调用，而 daemon 已不再发布身份，每次调用都被拒绝：worker 每次 spawn 时按当时的配置移除，只移除带 trigger-user 包装脚本标记的文件。与 `triggerUserAuth` 的「下个会话生效」一致，关闭或重新开启都只对之后 spawn 的 worker 生效（新会话、`/restart`、daemon 重启）；运行中的 worker 保持它启动时的包装，不在运行中删除，避免运行中再打开时包装已经不在、工具静默以本机登录态执行。
 - 远端后端、adopt、外部 app-server、workflow 和无飞书通道的会话不使用应用绑定。
-- Linux 与 macOS 使用相同的应用/用户解析路径，标准 PTY/Tmux 与托管 RPC（如 Codex）后端行为保持一致。
+- Linux 本机受管会话的 user 调用须通过当前执行的进程证明，覆盖标准 PTY/Tmux 与托管 RPC（如 Codex）。macOS 保留应用绑定和当前用户解析，不提供旧后台进程跨轮隔离保证。
 
 ## 实现
 
-新会话启动时生成自己的工具入口和配置，记录当前 App ID、品牌与真实 lark-cli 路径。botmux 用已有会话上下文确定当前请求者，并查询该用户在同一应用下的授权。会话入口的访问密钥只用于绑定应用，不引入调用进程扫描、回合证明或后台进程追踪。
+新会话启动时生成自己的工具入口和配置，记录当前 App ID、品牌与真实 lark-cli 路径。botmux 用已有执行权威确定当前请求者，并查询该用户在同一应用下的授权。会话入口的访问密钥绑定应用；Linux user 调用同时复用 `execution current` 的 socket 进程血缘检查，并在异步取得 token 后复核 turn、attempt 和 worker generation 等执行状态。旧轮后台进程及其新建子进程无法取得新轮用户凭证。机器触发的执行可在没有真人 actor 时使用该轮明确许可的工具委托身份。
 
 工具启动前清除继承的旧应用/用户凭证变量，再注入本次 App ID、品牌及 bot 或 user 凭证。用户 token 不得跨应用使用，未知用户不会借用 owner 或机器默认账户。CLI 原有 stdout、stderr、退出码和工作目录保持。
 

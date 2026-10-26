@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import {
   renderIdentityWrapper, writeSessionIdentity, publishActiveTurn,
   prepareTriggerUserCliEnv, sessionIdentityBinDir, sessionIdentityPath,
-  clearSessionIdentity, identityToolsFor,
+  clearSessionIdentity, identityToolsFor, renderIdentityEnv,
 } from '../src/core/cli-identity.js';
 import { buildFsPolicy, accessForPath, type FsPolicyContext } from '../src/adapters/cli/fs-policy.js';
 import { enumerateScratchSecretPaths } from '../src/adapters/backend/scratch-credentials.js';
@@ -30,12 +30,12 @@ console.error('real-stderr');
 process.exitCode = process.argv.includes('--fail') ? 7 : 0;
 `, { mode: 0o755 });
   wrapper = join(root, 'ecop');
-  writeFileSync(wrapper, renderIdentityWrapper('ecop', real), { mode: 0o755 });
+  writeFileSync(wrapper, renderIdentityWrapper('ecop', real, 'single'), { mode: 0o755 });
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 function grant(who = 'user-a', turn = 'turn-a', session = sid, jwt = token(who)) {
-  writeSessionIdentity(root, session, { tool: 'bytedcli', cloudJwt: jwt, openId: who, turnId: turn });
+  writeSessionIdentity(root, session, { tool: 'bytedcli', cloudJwt: jwt, openId: who, turnId: turn }, 'single');
   publishActiveTurn(root, session, turn, undefined, who);
 }
 function run(args: string[] = ['login', '--json'], extra: NodeJS.ProcessEnv = {}, entry = wrapper) {
@@ -81,7 +81,7 @@ describe('managed ECOP companion', () => {
 
   it('propagates a platform authorization denial without executing the real tool', () => {
     grant();
-    writeSessionIdentity(root, sid, { tool: 'bytedcli', mode: 'denied', turnId: 'turn-a', message: "authorize at https://example.test/credentials\nIt's required" });
+    writeSessionIdentity(root, sid, { tool: 'bytedcli', mode: 'denied', turnId: 'turn-a', message: "authorize at https://example.test/credentials\nIt's required" }, 'single');
     const r = run(); expect(r.status).toBe(77); expect(r.stdout).toBe('');
     expect(r.stderr).toContain('https://example.test/credentials');
     expect(r.stderr).toContain("It's required");
@@ -101,7 +101,7 @@ describe('managed ECOP companion', () => {
   it('denies unbound identities and withdrawn grants', () => {
     grant(); publishActiveTurn(root, sid, undefined);
     expect(run().status).toBe(77);
-    grant(); clearSessionIdentity(root, sid, 'bytedcli');
+    grant(); clearSessionIdentity(root, sid, 'bytedcli', undefined, 'single');
     expect(run().status).toBe(77);
   });
 
@@ -124,29 +124,45 @@ describe('managed ECOP companion', () => {
   it('blocks a CLI installed after session creation until the entry is refreshed', () => {
     const bins = join(root, 'late-bin'); mkdirSync(bins);
     const env: NodeJS.ProcessEnv = { ...process.env, PATH: bins + ':/usr/bin:/bin' };
-    prepareTriggerUserCliEnv(env, root, sid, { ...policy, tools: [...policy.tools] }, () => {});
+    prepareTriggerUserCliEnv(env, root, sid, { ...policy, tools: [...policy.tools] }, () => {}, 'single');
     const installed = join(sessionIdentityBinDir(root, sid), 'ecop');
     writeFileSync(join(bins, 'ecop'), readFileSync(real), { mode: 0o755 });
     grant();
     expect(run([], env, installed).status).toBe(127);
-    prepareTriggerUserCliEnv(env, root, sid, { ...policy, tools: [...policy.tools] }, () => {});
+    prepareTriggerUserCliEnv(env, root, sid, { ...policy, tools: [...policy.tools] }, () => {}, 'single');
     expect(JSON.parse(run([], env, installed).stdout).principal).toBe('user-a');
+  });
+
+  it('uses proven bytedcli credentials without disk material and never falls back on proof failure', () => {
+    const resolver = join(root, 'proof.cjs');
+    const body = renderIdentityEnv({ tool: 'bytedcli', cloudJwt: token('proven-user'), openId: 'proven-user', turnId: 'proof-turn' });
+    writeFileSync(resolver, `if (process.argv.at(-1) !== 'bytedcli') process.exit(9); process.stdout.write(${JSON.stringify(body)});`);
+    writeFileSync(wrapper, renderIdentityWrapper('ecop', real, 'proven', ['node', resolver]), { mode: 0o755 });
+    expect(JSON.parse(run().stdout).principal).toBe('proven-user');
+    expect(existsSync(sessionIdentityPath(root, sid, 'bytedcli'))).toBe(false);
+    grant('legacy-user', 'legacy-turn');
+    writeFileSync(resolver, 'process.exit(77);');
+    expect(run().status).toBe(77);
+    expect(run().stdout).toBe('');
+    expect(() => renderIdentityWrapper('ecop', real, 'proven')).toThrow();
   });
 
   it('installs and restores the companion only with bytedcli policy', () => {
     const bins = join(root, 'real-bin'); mkdirSync(bins);
     const ecop = join(bins, 'ecop'); writeFileSync(ecop, readFileSync(real), { mode: 0o755 });
     const env: NodeJS.ProcessEnv = { ...process.env, PATH: bins + ':' + process.env.PATH };
-    prepareTriggerUserCliEnv(env, root, sid, { ...policy, tools: [...policy.tools] }, () => {});
+    prepareTriggerUserCliEnv(env, root, sid, { ...policy, tools: [...policy.tools] }, () => {}, 'single');
     const installed = join(sessionIdentityBinDir(root, sid), 'ecop');
     expect(existsSync(installed)).toBe(true);
     expect(existsSync(join(root, 'ecop-runtime', sid))).toBe(true);
     grant(); expect(JSON.parse(run([], env, installed).stdout).principal).toBe('user-a');
-    prepareTriggerUserCliEnv(env, root, sid, { ...policy, tools: [...policy.tools] }, () => {});
+    prepareTriggerUserCliEnv(env, root, sid, { ...policy, tools: [...policy.tools] }, () => {}, 'single');
     grant('user-b', 'turn-b'); expect(JSON.parse(run([], env, installed).stdout).principal).toBe('user-b');
     expect(identityToolsFor(['lark-cli'])).not.toContain('ecop');
+    prepareTriggerUserCliEnv(env, root, sid, { ...policy, enabled: false, tools: [...policy.tools] }, () => {}, 'single');
+    expect(existsSync(installed)).toBe(false);
     const off = 'policy-off';
-    prepareTriggerUserCliEnv({ ...env }, root, off, { ...policy, enabled: false, tools: [...policy.tools] }, () => {});
+    prepareTriggerUserCliEnv({ ...env }, root, off, { ...policy, enabled: false, tools: [...policy.tools] }, () => {}, 'single');
     expect(existsSync(join(sessionIdentityBinDir(root, off), 'ecop'))).toBe(false);
   });
 });

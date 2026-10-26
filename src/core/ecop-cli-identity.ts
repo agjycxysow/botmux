@@ -6,9 +6,10 @@ const ECOP_WRAPPER_SOURCE = String.raw`
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const real = process.argv[1];
-const args = process.argv.slice(2);
+const options = JSON.parse(process.argv[2]);
+const args = process.argv.slice(3);
 const deny = (message) => {
   process.stderr.write('botmux: ecop ' + message + '\n');
   process.exit(77);
@@ -44,17 +45,30 @@ const identityPath = path.join(identityDir, 'bytedcli.env');
 const turnPath = path.join(identityDir, 'turn');
 let raw, live, identity;
 try {
-  const stat = fs.lstatSync(identityPath);
-  if (!stat.isFile() || (stat.mode & 0o077) !== 0
-      || (process.getuid && stat.uid !== process.getuid())) deny('身份记录权限错误，命令未执行。');
-  raw = fs.readFileSync(identityPath, 'utf8');
-  live = fs.readFileSync(turnPath, 'utf8');
+  if (options.model === 'proven') {
+    // Request the existing bytedcli identity from the trusted process-proof
+    // runner. Never consult a legacy file after a failed proof.
+    const resolver = options.identityResolver;
+    const response = spawnSync(resolver[0], [...resolver.slice(1), 'bytedcli'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 15000, maxBuffer: 65536,
+    });
+    if (response.status !== 0 || !response.stdout) deny('无法验证本轮执行身份，命令未执行。');
+    raw = response.stdout;
+  } else {
+    const stat = fs.lstatSync(identityPath);
+    if (!stat.isFile() || (stat.mode & 0o077) !== 0
+        || (process.getuid && stat.uid !== process.getuid())) deny('身份记录权限错误，命令未执行。');
+    raw = fs.readFileSync(identityPath, 'utf8');
+    live = fs.readFileSync(turnPath, 'utf8');
+  }
   identity = parseIdentity(raw);
 } catch { deny('本轮没有可用凭证，请完成 ByteCloud 授权后重试。'); }
 if (identity.BOTMUX_IDENTITY_MODE !== 'user') {
   deny(identity.BOTMUX_IDENTITY_DENY_MSG || '本轮没有可用凭证，请完成 ByteCloud 授权后重试。');
 }
-const [turn, caller] = live.split('\n');
+const [turn, caller] = options.model === 'proven'
+  ? [identity.BOTMUX_IDENTITY_TURN, identity.BOTMUX_IDENTITY_OPEN_ID]
+  : live.split('\n');
 if (!turn || !safe(caller) || !identity.BOTMUX_IDENTITY_TURN
     || identity.BOTMUX_IDENTITY_TURN !== turn || identity.BOTMUX_IDENTITY_OPEN_ID !== caller) {
   deny('凭证与当前回合或发送人不一致，命令未执行；请由本轮发起人重试。');
@@ -83,7 +97,7 @@ process.umask(0o077);
 try {
   fs.mkdirSync(cache, { recursive: true, mode: 0o700 });
   // Capture one consistent published generation immediately before execution.
-  if (fs.readFileSync(identityPath, 'utf8') !== raw || fs.readFileSync(turnPath, 'utf8') !== live) {
+  if (options.model === 'single' && (fs.readFileSync(identityPath, 'utf8') !== raw || fs.readFileSync(turnPath, 'utf8') !== live)) {
     deny('身份在启动前已切换，命令未执行；请重试。');
   }
 } catch { deny('无法准备本轮隔离目录或读取身份，命令未执行。'); }
@@ -109,8 +123,16 @@ child.on('close', (code, signal) => {
 });
 `;
 
-export function renderEcopIdentityWrapper(realBinaryPath: string): string {
+export function renderEcopIdentityWrapper(
+  realBinaryPath: string,
+  model: 'single' | 'proven',
+  identityResolver: readonly string[] | undefined,
+  wrapperMarker: string,
+): string {
   const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
   if (realBinaryPath.includes('\0') || realBinaryPath.includes('\n')) throw new Error('Invalid ecop binary path');
-  return `#!/bin/sh\n# botmux trigger-user ecop companion — generated, do not edit.\nexec node --input-type=commonjs -e ${quote(ECOP_WRAPPER_SOURCE)} ${quote(realBinaryPath)} "$@"\n`;
+  if (model !== 'single' && model !== 'proven') throw new Error('Invalid ecop identity model');
+  if (model === 'proven' && !identityResolver?.length) throw new Error('ECOP requires an execution identity resolver');
+  const options = JSON.stringify({ model, identityResolver });
+  return `#!/bin/sh\n${wrapperMarker}\nexec node --input-type=commonjs -e ${quote(ECOP_WRAPPER_SOURCE)} ${quote(realBinaryPath)} ${quote(options)} "$@"\n`;
 }
