@@ -152,6 +152,7 @@ export interface LogisticsAnalysisPendingCaptureFilters {
 export interface LogisticsAnalysisPendingLabelFilters {
   botId?: string;
   labelerRevision: string;
+  incrementalLabels?: boolean;
   limit?: number;
   offset?: number;
 }
@@ -279,6 +280,13 @@ export interface LogisticsAnalysisSummary {
   inProgress: number;
   unknown: number;
   needsReview: number;
+  labelCoverage: {
+    requestedRevision: string;
+    currentRevisionTopics: number;
+    crossRevisionManualTopics: number;
+    previousMachineRevisionTopics: number;
+    unlabeledTopics: number;
+  };
   lastDataTime: number | null;
   categories: LogisticsAnalysisCategorySummary[];
 }
@@ -355,15 +363,52 @@ const SOURCES = new Set<LogisticsAnalysisMessageSource>([
   'lark_history', 'botmux_send_marker', 'codex_rollout', 'legacy',
 ]);
 const BUSINESS_LABELS = new Set(['LB01', 'LB02', 'LB03', 'LB04', 'LB05', 'LB06', 'LB99']);
-const PROBLEM_LABELS = new Set(['LP01', 'LP02', 'LP03', 'LP04', 'LP05', 'LP99']);
+const PROBLEM_LABELS = new Set(['LP01', 'LP02', 'LP03', 'LP04', 'LP05', 'LP06', 'LP99']);
 const PROBLEM_LABEL_NAMES: Record<string, string> = {
   LP01: '前端埋点查询',
   LP02: '业务数据查询',
   LP03: '线上问题排查',
   LP04: '业务功能咨询',
   LP05: '商家反馈分析',
+  LP06: '研发基建',
   LP99: '其他',
 };
+
+function manualSourceSql(alias: string): string {
+  return `CASE WHEN json_valid(${alias}.label_reason) THEN json_extract(${alias}.label_reason,'$.source') END`;
+}
+
+function historicalManualRevisionSql(alias: string): string {
+  return `(${alias}.labeler_revision GLOB 'manual-doc:*'
+    OR ${alias}.labeler_revision GLOB 'manual-approval:*'
+    OR ${alias}.labeler_revision GLOB 'pre-manual-doc:*'
+    OR ${alias}.labeler_revision GLOB 'pre-manual-approval:*')`;
+}
+
+function validManualLabelSql(alias: string): string {
+  const canonicalRevision = `(length(${alias}.labeler_revision)=64
+    AND ${alias}.labeler_revision NOT GLOB '*[^a-f0-9]*')`;
+  const reason = `CASE WHEN json_valid(${alias}.label_reason) THEN ${alias}.label_reason ELSE '{}' END`;
+  return `(${alias}.needs_review=0
+    AND ${alias}.lb IN (${[...BUSINESS_LABELS].map(id => `'${id}'`).join(',')})
+    AND ${alias}.lp IN (${[...PROBLEM_LABELS].map(id => `'${id}'`).join(',')})
+    AND ${alias}.resolution_status IN ('resolved','in_progress')
+    AND (
+      (${manualSourceSql(alias)}='manual_doc_review'
+        AND (${alias}.labeler_revision GLOB 'manual-doc:*' OR ${canonicalRevision}))
+      OR (${manualSourceSql(alias)}='manual_taxonomy_approval'
+        AND ${alias}.lp='LP06'
+        AND json_extract(${reason},'$.canonicalLp')=${alias}.lp
+        AND json_extract(${reason},'$.canonicalResolutionStatus')=${alias}.resolution_status
+        AND json_extract(${reason},'$.approvalRevision') GLOB 'manual-approval:lp06:*'
+        AND (${alias}.labeler_revision=json_extract(${reason},'$.approvalRevision') OR ${canonicalRevision}))
+    ))`;
+}
+
+function machineLabelSql(alias: string): string {
+  return `(NOT ${historicalManualRevisionSql(alias)}
+    AND COALESCE(${manualSourceSql(alias)},'') NOT IN ('manual_doc_review','manual_taxonomy_approval'))`;
+}
 
 function required(value: string | null | undefined, name: string): string {
   const normalized = value?.trim() ?? '';
@@ -519,6 +564,7 @@ export class LogisticsAnalysisStore {
   readonly path: string;
   private readonly db: DatabaseSyncType;
   private readonly writable: boolean;
+  private readonly hasManualResolutionStatus: boolean;
 
   constructor(options: LogisticsAnalysisStoreOptions) {
     this.path = resolve(options.path ?? join(options.dataDir, 'logistics-analysis.sqlite'));
@@ -530,7 +576,13 @@ export class LogisticsAnalysisStore {
     this.db.exec('PRAGMA foreign_keys=ON;');
     if (this.writable) this.ensureSchema();
     else this.verifySchema();
+    this.hasManualResolutionStatus = this.db.prepare('PRAGMA table_info(sessions)').all()
+      .some(row => row.name === 'manual_resolution_status');
     this.secureFiles();
+  }
+
+  private manualInvalidSql(alias: string): string {
+    return this.hasManualResolutionStatus ? `COALESCE(${alias}.manual_resolution_status='invalid',0)` : '0';
   }
 
   close(): void {
@@ -1060,9 +1112,11 @@ export class LogisticsAnalysisStore {
     const captureVersion = changed ? oldCaptureVersion + 1 : oldCaptureVersion;
     let invalidatedLabels = 0;
     if (changed) {
+      const preserve = `(${historicalManualRevisionSql('labels')} OR COALESCE(${validManualLabelSql('labels')},0))`;
       const deleteResult = nextHash
-        ? this.db.prepare('DELETE FROM labels WHERE session_key=? AND content_hash<>?').run(sessionKey, nextHash)
-        : this.db.prepare('DELETE FROM labels WHERE session_key=?').run(sessionKey);
+        ? this.db.prepare(`DELETE FROM labels WHERE session_key=? AND content_hash<>? AND NOT ${preserve}`)
+          .run(sessionKey, nextHash)
+        : this.db.prepare(`DELETE FROM labels WHERE session_key=? AND NOT ${preserve}`).run(sessionKey);
       invalidatedLabels = Number(deleteResult.changes ?? 0);
     }
     const lastMessageAt = this.db.prepare(
@@ -1171,12 +1225,16 @@ export class LogisticsAnalysisStore {
     const limit = normalizeLimit(filters.limit);
     const offset = normalizeOffset(filters.offset);
     return this.readTransaction(() => {
-      const params: SqlValue[] = [revision];
+      const params: SqlValue[] = filters.incrementalLabels ? [] : [revision];
+      const covered = filters.incrementalLabels ? machineLabelSql('l') : 'l.labeler_revision=?';
       const clauses = [
         "s.capture_status='captured'",
+        `NOT ${this.manualInvalidSql('s')}`,
         's.content_hash IS NOT NULL',
         'EXISTS (SELECT 1 FROM messages um WHERE um.session_key=s.session_key AND um.role=\'user\')',
-        'NOT EXISTS (SELECT 1 FROM labels l WHERE l.session_key=s.session_key AND l.content_hash=s.content_hash AND l.capture_version=s.capture_version AND l.labeler_revision=?)',
+        `NOT EXISTS (SELECT 1 FROM labels l WHERE l.session_key=s.session_key
+          AND l.content_hash=s.content_hash AND l.capture_version=s.capture_version
+          AND (${covered} OR ${validManualLabelSql('l')}))`,
       ];
       if (filters.botId) { clauses.push('s.bot_id=?'); params.push(filters.botId); }
       params.push(limit, offset);
@@ -1188,18 +1246,25 @@ export class LogisticsAnalysisStore {
     });
   }
 
+  private validManualLabelInside(sessionKey: string, contentHash: string, captureVersion: number): QueryRow | undefined {
+    return this.db.prepare(`SELECT * FROM labels l WHERE l.session_key=? AND l.content_hash=?
+      AND l.capture_version=? AND ${validManualLabelSql('l')}
+      ORDER BY (${manualSourceSql('l')}='manual_taxonomy_approval') DESC,l.labeled_at DESC,l.labeler_revision DESC
+      LIMIT 1`).get(sessionKey, contentHash, captureVersion) as QueryRow | undefined;
+  }
+
   labelRunState(sessionKey: string, contentHash: string, labelerRevision: string): LogisticsAnalysisLabelRunState {
     const key = required(sessionKey, 'session_key');
     const hash = required(contentHash, 'content_hash');
     const revision = required(labelerRevision, 'labeler_revision');
     return this.readTransaction(() => {
       const session = this.db.prepare(
-        'SELECT content_hash,capture_version FROM sessions WHERE session_key=?',
+        `SELECT content_hash,capture_version,${this.manualInvalidSql('sessions')} AS manual_invalid FROM sessions WHERE session_key=?`,
       ).get(key) as QueryRow | undefined;
       if (!session) throw new Error(`analysis_session_not_found:${key}`);
       if (stringOrNull(session.content_hash) !== hash) throw new Error('analysis_label_content_stale');
       const captureVersion = Number(session.capture_version ?? 0);
-      const label = this.db.prepare(`
+      const label = this.validManualLabelInside(key, hash, captureVersion) ?? this.db.prepare(`
         SELECT 1 FROM labels
         WHERE session_key=? AND content_hash=? AND labeler_revision=? AND capture_version=?
       `).get(key, hash, revision, captureVersion);
@@ -1213,7 +1278,7 @@ export class LogisticsAnalysisStore {
       `).get(key, hash, revision, key, hash, revision) as QueryRow;
       const attempts = Number(row.attempts ?? 0);
       return {
-        completed: !!label,
+        completed: !!label || booleanValue(session.manual_invalid),
         attempts,
         nextAttempt: attempts + 1,
         remainingAttempts: Math.max(0, LOGISTICS_ANALYSIS_MAX_LABEL_ATTEMPTS - attempts),
@@ -1229,17 +1294,17 @@ export class LogisticsAnalysisStore {
     const now = timestamp(input.now ?? Date.now(), 'started_at')!;
     return this.transaction(() => {
         const session = this.db.prepare(
-          'SELECT content_hash,capture_version,capture_status FROM sessions WHERE session_key=?',
+          `SELECT content_hash,capture_version,capture_status,${this.manualInvalidSql('sessions')} AS manual_invalid FROM sessions WHERE session_key=?`,
         ).get(sessionKey) as QueryRow | undefined;
         if (!session) throw new Error(`analysis_session_not_found:${sessionKey}`);
       const captureVersion = Number(session.capture_version ?? 0);
       if (stringOrNull(session.content_hash) !== contentHash) throw new Error('analysis_label_content_stale');
       if (String(session.capture_status) !== 'captured') throw new Error('analysis_label_capture_not_ready');
-      const existingLabel = this.db.prepare(`
+      const existingLabel = this.validManualLabelInside(sessionKey, contentHash, captureVersion) ?? this.db.prepare(`
         SELECT 1 FROM labels
         WHERE session_key=? AND content_hash=? AND labeler_revision=? AND capture_version=?
       `).get(sessionKey, contentHash, labelerRevision, captureVersion);
-      if (existingLabel) {
+      if (existingLabel || booleanValue(session.manual_invalid)) {
         const runId = `run_skip_${createHash('sha256').update(`${sessionKey}\u0000${contentHash}\u0000${labelerRevision}`).digest('hex')}`;
         this.db.prepare(`
           INSERT OR IGNORE INTO label_runs
@@ -1322,7 +1387,7 @@ export class LogisticsAnalysisStore {
       }
       if (String(run.status) !== 'running') throw new Error('analysis_label_run_not_running');
       const session = this.db.prepare(
-        'SELECT content_hash,capture_version,capture_status FROM sessions WHERE session_key=?',
+        `SELECT content_hash,capture_version,capture_status,${this.manualInvalidSql('sessions')} AS manual_invalid FROM sessions WHERE session_key=?`,
       ).get(sessionKey) as QueryRow | undefined;
       if (!session) throw new Error(`analysis_session_not_found:${sessionKey}`);
       const captureVersion = Number(session.capture_version ?? 0);
@@ -1333,6 +1398,11 @@ export class LogisticsAnalysisStore {
           UPDATE label_runs SET status='expired',error=?,completed_at=? WHERE run_id=?
         `).run('content_changed_before_commit', labeledAt, runId);
         return { stale: true as const };
+      }
+      if (booleanValue(session.manual_invalid) || this.validManualLabelInside(sessionKey, contentHash, captureVersion)) {
+        this.db.prepare(`UPDATE label_runs SET status='skipped',error='manual_label_protected',completed_at=?
+          WHERE run_id=?`).run(labeledAt, runId);
+        return { stale: false as const, manualProtected: true };
       }
       this.db.prepare(`
         INSERT INTO labels (
@@ -1355,6 +1425,7 @@ export class LogisticsAnalysisStore {
       return { stale: false as const };
     });
     if (result.stale) throw new Error('analysis_label_content_stale');
+    if (result.manualProtected) throw new Error('analysis_manual_label_protected');
     return { sessionKey, contentHash, labelerRevision, labeledAt };
   }
 
@@ -1425,11 +1496,11 @@ export class LogisticsAnalysisStore {
   private buildRowsQuery(filters: LogisticsAnalysisFilters): { sql: string; params: SqlValue[] } {
     const params: SqlValue[] = [];
     const labelerRevision = required(filters.labelerRevision, 'labeler_revision');
-    const labelJoin = ' AND l.labeler_revision=?';
     const runJoin = ' AND r2.labeler_revision=?';
     params.push(labelerRevision);
     params.push(labelerRevision);
-    const clauses = ["s.scope='thread'"];
+    params.push(labelerRevision);
+    const clauses = ["s.scope='thread'", `NOT ${this.manualInvalidSql('s')}`];
     const from = parseDateBoundary(filters.from, false);
     const to = parseDateBoundary(filters.to, true);
     if (from !== undefined && to !== undefined && to <= from) throw new Error('analysis_invalid_date_range');
@@ -1461,6 +1532,9 @@ export class LogisticsAnalysisStore {
           l.labeler_revision AS labeler_revision,l.lb AS lb,l.lp AS lp,
           l.resolution_status AS resolution_status,l.confidence AS confidence,
           l.needs_review AS needs_review,l.label_reason AS label_reason,
+          EXISTS (SELECT 1 FROM labels old WHERE old.session_key=s.session_key
+            AND old.content_hash=s.content_hash AND old.capture_version=s.capture_version
+            AND old.labeler_revision<>? AND ${machineLabelSql('old')}) AS previous_machine_label,
           lr.status AS latest_run_status,
           (SELECT COUNT(*) FROM messages m WHERE m.session_key=s.session_key) AS message_count,
           CASE
@@ -1473,7 +1547,14 @@ export class LogisticsAnalysisStore {
         FROM sessions s
         LEFT JOIN labels l
           ON l.session_key=s.session_key AND s.content_hash IS NOT NULL
-          AND l.content_hash=s.content_hash AND l.capture_version=s.capture_version${labelJoin}
+          AND l.content_hash=s.content_hash AND l.capture_version=s.capture_version
+          AND l.labeler_revision=(SELECT chosen.labeler_revision FROM labels chosen
+            WHERE chosen.session_key=s.session_key AND chosen.content_hash=s.content_hash
+              AND chosen.capture_version=s.capture_version
+              AND (chosen.labeler_revision=? OR ${validManualLabelSql('chosen')})
+            ORDER BY ${validManualLabelSql('chosen')} DESC,
+              (${manualSourceSql('chosen')}='manual_taxonomy_approval') DESC,
+              chosen.labeled_at DESC,chosen.labeler_revision DESC LIMIT 1)
         LEFT JOIN label_runs lr ON lr.run_id=(
           SELECT r2.run_id FROM label_runs r2
           WHERE r2.session_key=s.session_key AND r2.content_hash=s.content_hash
@@ -1528,6 +1609,13 @@ export class LogisticsAnalysisStore {
         inProgress: count(row => String(row.label_status) === 'labeled' && row.resolution_status === 'in_progress'),
         unknown: count(row => String(row.label_status) === 'labeled' && row.resolution_status === 'unknown'),
         needsReview: count(row => String(row.label_status) === 'labeled' && booleanValue(row.needs_review)),
+        labelCoverage: {
+          requestedRevision: filters.labelerRevision,
+          currentRevisionTopics: count(row => row.label_status === 'labeled' && row.labeler_revision === filters.labelerRevision),
+          crossRevisionManualTopics: count(row => row.label_status === 'labeled' && row.labeler_revision !== filters.labelerRevision),
+          previousMachineRevisionTopics: count(row => ['pending','running','failed'].includes(String(row.label_status)) && Number(row.previous_machine_label) === 1),
+          unlabeledTopics: count(row => ['pending','running','failed'].includes(String(row.label_status)) && Number(row.previous_machine_label) !== 1),
+        },
         lastDataTime: rows.reduce<number | null>((latest, row) => {
           const value = numberOrNull(row.updated_at);
           return value === null ? latest : latest === null ? value : Math.max(latest, value);

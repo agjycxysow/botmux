@@ -315,7 +315,7 @@ describe('four-table logistics analysis store', () => {
       resolutionStatus: 'resolved',
     });
     const current = store.summary({ labelerRevision: 'revision-new' });
-    expect(current.categories).toHaveLength(6);
+    expect(current.categories).toHaveLength(7);
     expect(current.categories.find(row => row.taskType === 'LP99')).toMatchObject({
       topicCount: 1,
       resolvedCount: 0,
