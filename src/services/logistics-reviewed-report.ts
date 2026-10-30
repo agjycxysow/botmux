@@ -3,13 +3,16 @@ import { DatabaseSync } from 'node:sqlite';
 
 export const REVIEW_CHAT = 'oc_9d56ca617abdd6aa851732e32b4783ac';
 export const REVIEW_BOTS = ['cli_aad48799ad38dbc1', 'cli_a93aac77d3781cb6'];
-export const REVIEW_POLICY = 'logistics-thread-review/2';
+export const REVIEW_POLICY = 'logistics-thread-review/3';
+export const SIX_CATEGORY_REVIEW_POLICY = 'logistics-thread-review/2';
 export const LEGACY_REVIEW_POLICY = 'logistics-thread-review/1';
-const HOURS_CENTS: Record<string, number> = { LP01: 100, LP02: 175, LP03: 220, LP04: 125, LP05: 725, LP99: 0 };
+const SIX_CATEGORY_HOURS_CENTS: Record<string, number> = { LP01: 100, LP02: 175, LP03: 220, LP04: 125, LP05: 725, LP99: 0 };
+const HOURS_CENTS: Record<string, number | null> = { LP01: 100, LP02: 175, LP03: 220, LP04: 125, LP05: 725, LP06: null, LP99: 0 };
 const CATEGORY_NAMES: Record<string, string> = {
   LP01: '前端埋点查询', LP02: '业务数据查询', LP03: '线上问题排查',
-  LP04: '业务功能咨询', LP05: '商家反馈分析', LP99: '其他',
+  LP04: '业务功能咨询', LP05: '商家反馈分析', LP06: '研发基建', LP99: '其他',
 };
+const SIX_CATEGORY_NAMES = Object.fromEntries(Object.entries(CATEGORY_NAMES).filter(([lp]) => lp !== 'LP06'));
 const LEGACY_HOURS_CENTS: Record<string, number> = { frontend: 100, data: 175, troubleshoot: 220, consult: 125, feedback: 725, other: 0, development: 100 };
 const LEGACY_CATEGORY_NAMES: Record<string, string> = { frontend: '前端埋点查询', data: '业务数据查询', troubleshoot: '线上问题排查', consult: '业务功能咨询', feedback: '商家反馈分析', other: '其他', development: '小需求开发' };
 const MAX_CHECK_AGE = 90 * 60_000;
@@ -21,7 +24,7 @@ export interface ReviewTopic {
   title: string; url: string; answerCount: number; messageCount: number;
 }
 export interface ReviewPayload {
-  policy: typeof REVIEW_POLICY | typeof LEGACY_REVIEW_POLICY; batchId: string; chatId: string; asOf: number;
+  policy: typeof REVIEW_POLICY | typeof SIX_CATEGORY_REVIEW_POLICY | typeof LEGACY_REVIEW_POLICY; batchId: string; chatId: string; asOf: number;
   catalogComplete: boolean; threadsComplete: boolean; sourceFrom: string;
   reviewer: string; identityNamespace: string; referenceUrl: string;
   ratings: Array<{ id: string; value: number; rootId: string; answeredAt: number }>;
@@ -62,11 +65,12 @@ export function sourceDigest(root: SourceMessage, messages: SourceMessage[]): st
   })));
 }
 export function validatePayload(p: ReviewPayload): void {
-  if (![REVIEW_POLICY, LEGACY_REVIEW_POLICY].includes(p.policy) || p.chatId !== REVIEW_CHAT || !p.batchId || !p.reviewer || !p.identityNamespace
+  if (![REVIEW_POLICY, SIX_CATEGORY_REVIEW_POLICY, LEGACY_REVIEW_POLICY].includes(p.policy) || p.chatId !== REVIEW_CHAT || !p.batchId || !p.reviewer || !p.identityNamespace
       || !Number.isSafeInteger(p.asOf) || !p.catalogComplete || !p.threadsComplete || !p.topics.length)
     throw new Error('review_import_manifest_incomplete');
   const roots = new Set<string>();
-  const categoryNames = p.policy === REVIEW_POLICY ? CATEGORY_NAMES : LEGACY_CATEGORY_NAMES;
+  const categoryNames = p.policy === REVIEW_POLICY ? CATEGORY_NAMES
+    : p.policy === SIX_CATEGORY_REVIEW_POLICY ? SIX_CATEGORY_NAMES : LEGACY_CATEGORY_NAMES;
   for (const t of p.topics) {
     if (!t.rootId || roots.has(t.rootId) || !/^[a-f0-9]{64}$/.test(t.sourceDigest) || !t.reason
         || !Object.hasOwn(categoryNames, t.category) || !['resolved', 'in_progress', 'unknown', 'invalid'].includes(t.status)
@@ -89,23 +93,31 @@ export function validatePayload(p: ReviewPayload): void {
 }
 export function aggregate(topics: ReviewTopic[], policy: ReviewPayload['policy'] = REVIEW_POLICY) {
   const valid = topics.filter(t => t.status !== 'invalid');
-  const hours = policy === REVIEW_POLICY ? HOURS_CENTS : LEGACY_HOURS_CENTS;
-  const names = policy === REVIEW_POLICY ? CATEGORY_NAMES : LEGACY_CATEGORY_NAMES;
-  let grossCents = 0, costCents = 0, eligible = 0;
+  const hours = policy === REVIEW_POLICY ? HOURS_CENTS
+    : policy === SIX_CATEGORY_REVIEW_POLICY ? SIX_CATEGORY_HOURS_CENTS : LEGACY_HOURS_CENTS;
+  const names = policy === LEGACY_REVIEW_POLICY ? LEGACY_CATEGORY_NAMES : CATEGORY_NAMES;
+  let grossCents = 0, costCents = 0, eligible = 0, uncalibratedResolvedTopics = 0;
   const categories = Object.entries(hours).map(([category, cents]) => {
     const all = valid.filter(t => t.category === category), solved = all.filter(t => t.status === 'resolved');
-    const gross = solved.length * cents, cost = solved.reduce((s, t) => s + Math.max(0, t.effectiveRounds - 4) * 5, 0);
-    grossCents += gross; costCents += cost; eligible += solved.length;
+    const gross = cents === null ? null : solved.length * cents;
+    const cost = cents === null ? null : solved.reduce((s, t) => s + Math.max(0, t.effectiveRounds - 4) * 5, 0);
+    grossCents += gross ?? 0; costCents += cost ?? 0;
+    if (cents === null) uncalibratedResolvedTopics += solved.length;
+    else eligible += solved.length;
     return { taskType: category, name: names[category], topicCount: all.length, resolvedCount: solved.length,
       inProgressCount: all.filter(t => t.status === 'in_progress').length,
       unknownCount: all.filter(t => t.status === 'unknown').length,
-      resolutionRate: all.length ? solved.length / all.length : null, hoursPerResolvedTopic: cents / 100,
-      grossHours: gross / 100, followupCostHours: cost / 100, savedHours: (gross - cost) / 100 };
+      resolutionRate: all.length ? solved.length / all.length : null,
+      hoursPerResolvedTopic: cents === null ? null : cents / 100,
+      efficiencyBaselineStatus: cents === null ? 'missing' : 'configured',
+      efficiencyEligibleTopics: cents === null ? 0 : solved.length,
+      grossHours: gross === null ? null : gross / 100, followupCostHours: cost === null ? null : cost / 100,
+      savedHours: gross === null || cost === null ? null : (gross - cost) / 100 };
   });
   return { valid: valid.length, resolved: valid.filter(t => t.status === 'resolved').length,
     inProgress: valid.filter(t => t.status === 'in_progress').length, unknown: valid.filter(t => t.status === 'unknown').length,
     invalid: topics.length - valid.length, people: new Set(valid.map(t => t.questioner)).size,
-    grossCents, costCents, netCents: grossCents - costCents, eligible, categories };
+    grossCents, costCents, netCents: grossCents - costCents, eligible, uncalibratedResolvedTopics, categories };
 }
 function schema(db: DatabaseSync): void {
   db.exec(`CREATE TABLE IF NOT EXISTS logistics_review_batches (

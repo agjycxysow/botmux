@@ -98,6 +98,8 @@ export interface LogisticsAnalysisCollectionOptions {
   harnessRoot?: string;
   model?: string;
   now?: number;
+  /** Opt-in hourly selection; explicit revision relabeling remains the default. */
+  incrementalLabels?: boolean;
   /** Internal run-only budget/cursor plumbing; standalone label remains one page. */
   modelBudget?: number;
   modelCounter?: { started: number };
@@ -1125,6 +1127,7 @@ function allPendingLabels(
   store: LogisticsAnalysisStore,
   botId: string,
   labelerRevision: string,
+  incrementalLabels?: boolean,
 ): Array<LogisticsAnalysisSession & { messages: LogisticsAnalysisMessage[] }> {
   const rows: Array<LogisticsAnalysisSession & { messages: LogisticsAnalysisMessage[] }> = [];
   let offset = 0;
@@ -1132,6 +1135,7 @@ function allPendingLabels(
     const current = store.listPendingLabels({
       botId,
       labelerRevision,
+      incrementalLabels,
       limit: LOGISTICS_ANALYSIS_MAX_PAGE_LIMIT,
       offset,
     });
@@ -1144,8 +1148,8 @@ function allPendingLabels(
   return [...unique.values()].sort((left, right) => left.sessionKey.localeCompare(right.sessionKey));
 }
 
-function countPendingLabels(store: LogisticsAnalysisStore, botId: string, revision: string): number {
-  return allPendingLabels(store, botId, revision).length;
+function countPendingLabels(store: LogisticsAnalysisStore, botId: string, revision: string, incrementalLabels?: boolean): number {
+  return allPendingLabels(store, botId, revision, incrementalLabels).length;
 }
 
 function runtimeRow(body: unknown): LogisticsAnalysisRuntimeSessionSnapshot | undefined {
@@ -1291,7 +1295,7 @@ function labelPageBase(
   revision: string,
 ): { page: LogisticsAnalysisTopicPage<LogisticsAnalysisSession & { messages: LogisticsAnalysisMessage[] }>; groups: Map<string, TopicGroup> } {
   const selectedTopics = new Set(snapshot.groups.map(group => group.sessionKey));
-  const pending = allPendingLabels(store, ctx.options.bot.larkAppId, revision)
+  const pending = allPendingLabels(store, ctx.options.bot.larkAppId, revision, ctx.options.incrementalLabels)
     .filter(session => selectedTopics.has(session.sessionKey));
   const page = paginateLogisticsAnalysisTopics(pending, {
     limit: ctx.options.limit,
@@ -1539,6 +1543,7 @@ async function labelPageWithStore(
       } catch (error) {
         const code = safeErrorCode(error, 'label_commit_failed');
         if (code === 'analysis_label_content_stale') result.expired += 1;
+        else if (code === 'analysis_manual_label_protected') result.skipped += 1;
         else result.failed += 1;
         result.failures.push({ topicPublicId: buildLogisticsTopicPublicId(candidate.sessionKey), code });
       }
@@ -1549,7 +1554,7 @@ async function labelPageWithStore(
     result.hasMore = true;
     result.nextCursor = encodeCursor(base.page.candidates[lastExaminedIndex]!.sessionKey);
   }
-  result.pendingLabel = countPendingLabels(store, ctx.options.bot.larkAppId, revision);
+  result.pendingLabel = countPendingLabels(store, ctx.options.bot.larkAppId, revision, ctx.options.incrementalLabels);
   return result;
 }
 
@@ -1723,7 +1728,7 @@ export async function labelLogisticsAnalysis(
   if (!ctx.options.apply) {
     const store = new AnalysisStore({ dataDir: dirname(ctx.dbPath), path: ctx.dbPath, readOnly: true });
     try {
-      const pending = allPendingLabels(store, ctx.options.bot.larkAppId, revisionInfo.revision)
+      const pending = allPendingLabels(store, ctx.options.bot.larkAppId, revisionInfo.revision, ctx.options.incrementalLabels)
         .filter(session => !ctx.options.sessionPrefix || session.botmuxSessionId?.startsWith(ctx.options.sessionPrefix));
       const page = paginateLogisticsAnalysisTopics(pending, { limit: ctx.options.limit, cursor: ctx.options.cursor });
       const result = emptyLabelStage(ctx, revisionInfo.revision, page.totalCandidates, page.candidates.length, page);
@@ -1817,7 +1822,7 @@ async function dryRunAnalysis(ctx: CollectionContext): Promise<RunResult> {
     if (existsSync(ctx.dbPath)) {
       const store = new AnalysisStore({ dataDir: dirname(ctx.dbPath), path: ctx.dbPath, readOnly: true });
       try {
-        pendingLabel = countPendingLabels(store, ctx.options.bot.larkAppId, revision);
+        pendingLabel = countPendingLabels(store, ctx.options.bot.larkAppId, revision, ctx.options.incrementalLabels);
         labelPlan = { databasePresent: true, harnessRevision: revision, pendingLabel };
       } finally { store.close(); }
     } else {
@@ -1941,7 +1946,7 @@ export async function runLogisticsAnalysis(
         labelTotal.failures.push(...page.failures);
         labelTotal.hasMore = page.hasMore;
         labelTotal.nextCursor = page.nextCursor ?? null;
-        pendingLabel = page.pendingLabel ?? countPendingLabels(store, ctx.options.bot.larkAppId, labelRevision.revision);
+        pendingLabel = page.pendingLabel ?? countPendingLabels(store, ctx.options.bot.larkAppId, labelRevision.revision, ctx.options.incrementalLabels);
         if (page.hasMore) {
           labelCursor = page.nextCursor ?? undefined;
           if (modelCounter.started >= LOGISTICS_ANALYSIS_RUN_MODEL_BUDGET) {
@@ -2027,6 +2032,7 @@ function parseAnalysisArgs(sub: string, args: string[], dataDir: string): Logist
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index]!;
     if (arg === '--apply' || arg === '--dry-run') continue;
+    if (sub === 'run' && arg === '--incremental-labels') continue;
     const flag = arg.includes('=') ? arg.slice(0, arg.indexOf('=')) : arg;
     if (!knownWithValue.has(flag)) throw new Error(`analysis_unknown_option:${arg}`);
     if (!arg.includes('=')) index += 1;
@@ -2074,6 +2080,7 @@ function parseAnalysisArgs(sub: string, args: string[], dataDir: string): Logist
     dbPath,
     bot,
     apply: hasFlag(args, '--apply'),
+    incrementalLabels: sub === 'run' && hasFlag(args, '--incremental-labels'),
     limit: parsedLimit,
     cursor: optionValue(args, '--cursor'),
     sessionPrefix: optionValue(args, '--session'),
@@ -2090,7 +2097,7 @@ function printAnalysisUsage(message?: string): never {
   botmux logistics analysis sync-catalog [--db <four-table-db>] --bot <appId> [--apply]
   botmux logistics analysis capture [--db <four-table-db>] --bot <appId> [--limit N] [--cursor <opaque>] [--apply]
   botmux logistics analysis label [--db <four-table-db>] --bot <appId> [--harness-root <dir>] [--model <id>] [--limit N] [--cursor <opaque>] [--concurrency N] [--apply]
-  botmux logistics analysis run [--db <four-table-db>] --bot <appId> [--harness-root <dir>] [--model <id>] [--limit N] [--concurrency N] [--apply]
+  botmux logistics analysis run [--db <four-table-db>] --bot <appId> [--harness-root <dir>] [--model <id>] [--limit N] [--concurrency N] [--incremental-labels] [--apply]
   botmux logistics analysis migrate --source <source.sqlite> --db <four-table-db> [--apply]
 
 All commands default to dry-run. The omitted --db default is the dedicated

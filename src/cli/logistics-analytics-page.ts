@@ -127,7 +127,7 @@ export function renderLogisticsAnalyticsPage(): string {
       <div>
         <p class="eyebrow">READ-ONLY ANALYTICS</p>
         <h1>物流专家 · 会话概览</h1>
-        <p class="subtitle">按根话题主要目标统计；当前口径固定为六类，未知状态保留在解决率分母。</p>
+        <p class="subtitle">按根话题主要目标统计；未知状态保留在解决率分母，研发基建无效率基准。</p>
       </div>
       <section class="run-summary" aria-live="polite" id="run-summary">
         <strong>调度状态</strong>
@@ -156,7 +156,7 @@ export function renderLogisticsAnalyticsPage(): string {
     <section class="metrics" id="metrics" aria-label="概览计数"></section>
 
     <section class="panel table-panel">
-      <div class="panel-header"><h2>六类解决率</h2><span>unknown 和进行中进入分母，invalid 排除</span></div>
+      <div class="panel-header"><h2>分类解决率</h2><span>unknown 和进行中进入分母，invalid 排除</span></div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>分类</th><th>话题数</th><th>已解决</th><th>进行中</th><th>未知</th><th>解决率</th></tr></thead>
@@ -211,7 +211,7 @@ export function renderLogisticsAnalyticsPage(): string {
       },
       lp: {
         LP01: '前端埋点查询', LP02: '业务数据查询', LP03: '线上问题排查',
-        LP04: '业务功能咨询', LP05: '商家反馈分析', LP99: '其他'
+        LP04: '业务功能咨询', LP05: '商家反馈分析', LP06: '研发基建', LP99: '其他'
       }
     };
     const RESOLUTION = { resolved: '已解决', in_progress: '进行中', unknown: '未知' };
@@ -514,7 +514,15 @@ export function renderLogisticsAnalyticsPage(): string {
         renderSessions(results[3]);
         renderDataTime(results[0]);
         renderRunStatus(results[4]);
-        setState(results[3].total ? '' : '暂无符合当前筛选条件的数据', 'empty');
+        const coverage = results[0].labelCoverage;
+        if (!results[3].total) {
+          setState('暂无符合当前筛选条件的数据', 'empty');
+        } else if (coverage && coverage.previousMachineRevisionTopics > 0) {
+          setState('当前 revision 尚未覆盖的旧机器标签：' + coverage.previousMachineRevisionTopics
+            + ' 个；跨 revision 有效人工标签：' + coverage.crossRevisionManualTopics + ' 个。', 'warning');
+        } else {
+          setState('');
+        }
       } catch (error) {
         if (serial !== loadSerial) return;
         setState(error instanceof Error ? error.message : String(error), 'error');

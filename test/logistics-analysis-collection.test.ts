@@ -245,6 +245,36 @@ describe('logistics analysis collection', () => {
     expect(modelCalls).toBe(1);
   });
 
+  it('opts hourly run into incremental selection while default run can relabel a new revision', async () => {
+    const { dataDir, dbPath } = paths();
+    let requestedRevision = revision;
+    let modelCalls = 0;
+    const deps = baseDeps([session('revision-switch')], async () => history(), {
+      resolveHarnessRevision: () => requestedRevision,
+      createModelRunner: () => async () => {
+        modelCalls += 1;
+        return { businessCategory: 'LB06', problemType: 'LP06', resolutionStatus: 'resolved', overallConfidence: 'high', needsReview: false };
+      },
+    });
+    const options = { dataDir, dbPath, bot, apply: true, harnessRoot: '/fixture', now: oldAt + 30 * 60_000 };
+    expect((await runLogisticsAnalysis(options, deps)).status).toBe('succeeded');
+    requestedRevision = 'b'.repeat(64);
+    const incremental = await runLogisticsAnalysis({ ...options, incrementalLabels: true }, deps);
+    expect(incremental).toMatchObject({ status: 'succeeded', pendingLabel: 0 });
+    expect(modelCalls).toBe(1);
+    let store = new LogisticsAnalysisStore({ dataDir, path: dbPath, readOnly: true });
+    try {
+      expect(store.summary({ labelerRevision: requestedRevision })).toMatchObject({
+        labeledTopics: 0, labelCoverage: { previousMachineRevisionTopics: 1, currentRevisionTopics: 0 },
+      });
+    } finally { store.close(); }
+    expect((await runLogisticsAnalysis(options, deps)).status).toBe('succeeded');
+    expect(modelCalls).toBe(2);
+    store = new LogisticsAnalysisStore({ dataDir, path: dbPath, readOnly: true });
+    try { expect(store.summary({ labelerRevision: requestedRevision }).labeledTopics).toBe(1); }
+    finally { store.close(); }
+  });
+
   it('expires a model result when visible history changes during model execution', async () => {
     const { dataDir, dbPath } = paths();
     let calls = 0;
